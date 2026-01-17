@@ -199,13 +199,12 @@ bool UUnitMovementComponent::TickMoveAlongPath(float DeltaTime)
     return false;
 }
 
-//Reworked Version 1
+//Reworked Version 2
 bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& MyPos, float DeltaTime)
 {
     bool bIsClipping = false;
     bool bGoalAdjusted = false;
-    if (!CharacterOwner)
-        return bGoalAdjusted;
+    if (!CharacterOwner) return bGoalAdjusted;
 
     // --- setup ---
     FVector ToGoal = CurrentGoal - MyPos;
@@ -214,25 +213,27 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
     float Range = FMath::Max(50.f, AvoidanceCheckDistance);
     if (DistToGoal < KINDA_SMALL_NUMBER) return bGoalAdjusted;
 
+    // CHANGE: corridor length should not extend beyond the goal
+    const float CorridorLen = FMath::Min(Range, DistToGoal);
+
     //Debuging Variables
-    //FVector ForwardEnd = MyPos + DesiredDir * Range;
     FVector ForwardEnd = MyPos + FVector(DesiredDir.X, DesiredDir.Y, 0.f).GetSafeNormal() * Range;
     bool bDetectedInFront = false;
     bool bBlockingPath = false;
     FColor ForwardColor = FColor::Green;
 
     // Overlap query to find nearby pawns/physics bodies
-    TArray<FOverlapResult> Overlaps; //array of type overlap results
-    FCollisionObjectQueryParams ObjQuery; //stores the type of objects to look for, each one is below
+    TArray<FOverlapResult> Overlaps;
+    FCollisionObjectQueryParams ObjQuery;
     ObjQuery.AddObjectTypesToQuery(ECC_Pawn);
     ObjQuery.AddObjectTypesToQuery(ECC_PhysicsBody);
 
     FCollisionQueryParams Params(SCENE_QUERY_STAT(AvoidanceOverlap), true, CharacterOwner);
 
-    bool bAny = GetWorld()->OverlapMultiByObjectType( //bool to tell if hit anything
-        Overlaps,           //adding each element hit to array
+    bool bAny = GetWorld()->OverlapMultiByObjectType(
+        Overlaps,
         MyPos,
-        FQuat::Identity,    //used to say dont rotate, aligned with world axis
+        FQuat::Identity,
         ObjQuery,
         FCollisionShape::MakeSphere(Range),
         Params
@@ -240,7 +241,7 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
 
     TArray<AActor*> BlockingActors;
 
-    if (bAny && Overlaps.Num() > 0) //if i did hit something and it was valid
+    if (bAny && Overlaps.Num() > 0)
     {
         FVector Forward2D = FVector(DesiredDir.X, DesiredDir.Y, 0.f).GetSafeNormal();
         if (!Forward2D.IsNearlyZero())
@@ -248,28 +249,28 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
             // My velocities (2D)
             FVector MyVel2D = CharacterOwner->GetVelocity();
             MyVel2D.Z = 0.f;
-            if (MyVel2D.IsNearlyZero())
-                MyVel2D = Forward2D * MoveSpeed;
+            if (MyVel2D.IsNearlyZero()) MyVel2D = Forward2D * MoveSpeed;
 
             float MySpeed2D = MyVel2D.Size();
             if (MySpeed2D < 1.f) MySpeed2D = FMath::Max(1.f, MoveSpeed);
-            float tMax = Range / MySpeed2D;          // e.g., 600/100 = 6s
-            tMax = FMath::Clamp(tMax, 0.f, 8.f);     // safety clamp
+
+            // CHANGE: only predict up to the distance we will actually travel toward the goal
+            float tMax = CorridorLen / MySpeed2D;
+            tMax = FMath::Clamp(tMax, 0.f, 8.f);
 
             for (const FOverlapResult& R : Overlaps)
             {
                 AActor* Other = R.GetActor();
-                if (!Other || Other == CharacterOwner) continue; //if other is nullptr or us skip this for loop turn
-                if (MoveTargetActor.IsValid() && Other == MoveTargetActor.Get()) continue; //if we are following an actor and other is equal to it skip this for loop turn
+                if (!Other || Other == CharacterOwner) continue;
+                if (MoveTargetActor.IsValid() && Other == MoveTargetActor.Get()) continue;
 
                 FVector OtherLoc = Other->GetActorLocation();
-                FVector ToOther2D(OtherLoc.X - MyPos.X, OtherLoc.Y - MyPos.Y, 0.f); //diffrence between units
+                FVector ToOther2D(OtherLoc.X - MyPos.X, OtherLoc.Y - MyPos.Y, 0.f);
                 float DistToOther = ToOther2D.Size();
-                if (DistToOther < KINDA_SMALL_NUMBER) continue; //might need tweaking not sure
+                if (DistToOther < KINDA_SMALL_NUMBER) continue;
 
                 // --- dynamic radii ---
                 float OtherRadius = SetOtherRadius(Other);
-
                 float PathCorridor = UnitRadius + OtherRadius + ExtraBuffer;
 
                 // Other velocities (2D)
@@ -300,12 +301,11 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
                     RelAtClosest = ToOther2D + RelVel2D * tClosest;
                 }
 
-                //lambda function is actully bool InDynamicCorridor(const FVector& Rel)
+                // CHANGE: use CorridorLen instead of Range so actors beyond the goal don't count as blocking
                 auto InDynamicCorridor = [&](const FVector& Rel) -> bool
                 {
                     float Along = FVector::DotProduct(Rel, Forward2D);
-                    if (Along <= 0.f || Along > Range)
-                        return false;
+                    if (Along <= 0.f || Along > CorridorLen) return false;
 
                     FVector ClosestRel = Forward2D * Along;
                     float PerpDist = FVector(Rel.X - ClosestRel.X, Rel.Y - ClosestRel.Y, 0.f).Size();
@@ -314,8 +314,12 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
 
                 bool bInCorridorNow = InDynamicCorridor(ToOther2D);
                 bool bInCorridorSoon = InDynamicCorridor(RelAtClosest);
-                // X-crossing fix: collide soon even if not "ahead"
-                bool bWillCollideSoon = (RelAtClosest.Size() < PathCorridor);
+
+                // X-crossing fix, but ALSO require it happens before reaching the goal
+                float AlongClosest = FVector::DotProduct(RelAtClosest, Forward2D);
+                bool bWithinTravel = (AlongClosest > 0.f && AlongClosest <= CorridorLen);
+
+                bool bWillCollideSoon = bWithinTravel && (RelAtClosest.Size() < PathCorridor);
 
                 bool bBlockingDynamic = (bInCorridorNow || bInCorridorSoon || bWillCollideSoon);
 
@@ -325,7 +329,7 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
                 }
 
                 bDetectedInFront = true; //DEBUG
-            } // for overlaps
+            }
         }
 
         if (BlockingActors.Num() > 0)
@@ -335,20 +339,16 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
                 bGoalAdjusted = GoalAdjustment();
                 if (bGoalAdjusted)
                 {
-                    return bGoalAdjusted; //ajusted
+                    return bGoalAdjusted; // adjusted
                 }
             }
-            bBlockingPath = true; //DEBUG
-            ApplyAvoidance(DesiredDir, MyPos, BlockingActors);
-            if (GEngine)
-            {
-                GEngine->AddOnScreenDebugMessage((uint64)((PTRINT)this), 187, FColor::Red, FString::Printf(TEXT("Avoid")));
-            }
-        }
-    } // bAny
 
+            bBlockingPath = true; //DEBUG
+            //ApplyAvoidance(DesiredDir, MyPos, BlockingActors);
+        }
+    }
     /*-----------------------------------------DEBUG----------------------------------------------------*/
-    // Clipping visualizer: check true capsule overlap (overlap using our capsule)
+        // Clipping visualizer: check true capsule overlap (overlap using our capsule)
     if (CapComp)
     {
         FVector CapCenter = CapComp->GetComponentLocation();
@@ -416,63 +416,131 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
 }
 
 //ApplyAvoidance
-// Version 5 — Predictive + near-field separation + stable velocity + smoothing
+//Version 9
 void UUnitMovementComponent::ApplyAvoidance(FVector& DesiredDir, const FVector& MyPos, TArray<AActor*> NearActors)
 {
     // --- 2D only ---
-    const FVector ForwardDir = FVector(DesiredDir.X, DesiredDir.Y, 0.f).GetSafeNormal();
-    if (ForwardDir.IsNearlyZero() || !MoveComp)
-        return;
+    FVector ForwardDir = FVector(DesiredDir.X, DesiredDir.Y, 0.f).GetSafeNormal();
+    if (ForwardDir.IsNearlyZero() || !CharacterOwner || !MoveComp) return;
 
-    // Use Actor velocity (more consistent than CharacterMovement->Velocity timing)
-    FVector MyVel2D = GetOwner()->GetVelocity();
+    // -------------------------
+    // FINAL GOAL GUARD (IMPORTANT)
+    // -------------------------
+    // When we're navigating to the FINAL path point, avoidance should not "pass around" and cause orbiting.
+    // Let GoalAdjustment/ComputeSafestPoint handle occupied destination.
+    const bool bHasPath = (InternalPathPoints.Num() > 0);
+    const bool bIsFinalPoint = bHasPath && (CurrentPathIndex >= InternalPathPoints.Num() - 1);
+
+    float DistToFinal2D = 0.f;
+    if (bIsFinalPoint)
+    {
+        const FVector ToFinal = InternalPathPoints.Last() - MyPos;
+        DistToFinal2D = FVector(ToFinal.X, ToFinal.Y, 0.f).Size();
+    }
+
+    // If we're close to the final destination, disable lateral avoidance completely.
+    // Only allow separation if we are actually overlapping.
+    const float FinalGuardRadius = FMath::Max(80.f, UnitRadius * 2.25f);
+    const bool bFinalGuard = bIsFinalPoint && (DistToFinal2D > 0.f) && (DistToFinal2D <= FinalGuardRadius);
+
+    // -------------------------
+    // Stable velocities / horizon
+    // -------------------------
+    FVector MyVel2D = CharacterOwner->GetVelocity();
     MyVel2D.Z = 0.f;
     if (MyVel2D.IsNearlyZero())
-        MyVel2D = ForwardDir * MoveComp->MaxWalkSpeed;
+    {
+        MyVel2D = ForwardDir * FMath::Max(1.f, MoveSpeed);
+    }
 
-    // --- SPEED NORMALIZATION (keep your feel) ---
-    const float Speed = MoveComp->MaxWalkSpeed;
-    float SpeedFactor = FMath::Clamp(Speed / 600.f, 0.5f, 2.0f);
+    const float Speed = FMath::Max(1.f, MoveSpeed);
+    const float SpeedFactor = FMath::Clamp(Speed / 600.f, 0.5f, 2.0f);
+    const float Horizon = FMath::Clamp(0.25f + 0.35f * SpeedFactor, 0.25f, 0.90f);
 
-    // Earlier prediction at higher speeds (seconds)
-    const float Horizon = FMath::Clamp(0.25f + 0.20f * SpeedFactor, 0.25f, 0.55f);
+    // -------------------------
+    // File-static avoidance state (no header changes)
+    // -------------------------
+    struct FAvoidState
+    {
+        TWeakObjectPtr<AActor> Threat;
+        float UntilTime = 0.f;
+        int32 Side = 0;           // -1 or +1, committed
+        float YieldUntilTime = 0.f;
+        FVector LastPos = FVector::ZeroVector;
+        float LastGoalDist = 0.f;
+        float StuckTime = 0.f;
+    };
 
-    float TotalSideWeight = 0.f;
-    FVector AccumulatedSideDir = FVector::ZeroVector;
+    static TMap<TWeakObjectPtr<const UUnitMovementComponent>, FAvoidState> StateMap;
+    FAvoidState& S = StateMap.FindOrAdd(this);
+
+    const float Now = (GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f);
+
+    // Update stuck/progress tracker (uses final point if present, otherwise current goal)
+    {
+        FVector Goal = bHasPath ? InternalPathPoints[CurrentPathIndex] : CurrentGoal;
+        const float GoalDist = FVector::Dist2D(MyPos, Goal);
+
+        if (!S.LastPos.IsNearlyZero())
+        {
+            const float Moved = FVector::Dist2D(MyPos, S.LastPos);
+            const bool bProgress = (GoalDist + 1.0f < S.LastGoalDist); // got closer
+
+            // "stuck" if we are barely moving AND not progressing
+            if (Moved < 2.0f && !bProgress)
+                S.StuckTime += GetWorld()->GetDeltaSeconds();
+            else
+                S.StuckTime = FMath::Max(0.f, S.StuckTime - GetWorld()->GetDeltaSeconds() * 2.0f);
+        }
+
+        S.LastPos = MyPos;
+        S.LastGoalDist = GoalDist;
+    }
+
+    // If we are currently in a yield window, reduce forward drive (lets the other pass)
+    const bool bYielding = (Now < S.YieldUntilTime);
+
+    // -------------------------
+    // Find primary threat + accumulate separation
+    // -------------------------
+    AActor* Primary = nullptr;
+    float PrimaryScore = -FLT_MAX;
+
+    // We only accumulate separation in final-guard mode.
+    FVector AccumSide = FVector::ZeroVector;
+    FVector AccumSep = FVector::ZeroVector;
+    float TotalSideW = 0.f;
+    float TotalSepW = 0.f;
 
     for (AActor* Other : NearActors)
     {
+        if (!Other || Other == CharacterOwner) continue;
+        if (MoveTargetActor.IsValid() && Other == MoveTargetActor.Get()) continue;
+
         const FVector OtherPos = Other->GetActorLocation();
         const FVector RelPos2D = FVector(OtherPos.X - MyPos.X, OtherPos.Y - MyPos.Y, 0.f);
 
         const float DistNow = RelPos2D.Size();
-        if (DistNow < KINDA_SMALL_NUMBER)
-            continue;
+        if (DistNow < KINDA_SMALL_NUMBER) continue;
 
         const FVector DirToOtherNow = RelPos2D / DistNow;
 
-        // Front-hemisphere filter
+        // Keep loose front filter so X crossing still triggers
         const float ForwardDot = FVector::DotProduct(ForwardDir, DirToOtherNow);
-        if (ForwardDot < -0.1f)
-            continue;
+        if (ForwardDot < -0.25f) continue;
 
         const float OtherRadius = SetOtherRadius(Other);
         const float CombinedRadius = UnitRadius + OtherRadius + ExtraBuffer;
 
-        // --- Stable other velocity ---
         FVector OtherVel2D = Other->GetVelocity();
         OtherVel2D.Z = 0.f;
-
-        // If other velocity is near zero, assume it is moving roughly forward at its max speed if possible
         if (OtherVel2D.IsNearlyZero())
         {
-            if (ACharacter* OtherChar = Cast<ACharacter>(Other))
+            if (ACharacter* OC = Cast<ACharacter>(Other))
             {
-                if (UCharacterMovementComponent* OtherMove = OtherChar->GetCharacterMovement())
+                if (UCharacterMovementComponent* OMove = OC->GetCharacterMovement())
                 {
-                    const float OtherSpeed = OtherMove->MaxWalkSpeed;
-                    // Approx direction: if moving, velocity would exist; so use "toward me" as worst-case
-                    OtherVel2D = (-DirToOtherNow) * OtherSpeed;
+                    OtherVel2D = (-DirToOtherNow) * FMath::Max(1.f, OMove->MaxWalkSpeed);
                 }
             }
         }
@@ -480,92 +548,168 @@ void UUnitMovementComponent::ApplyAvoidance(FVector& DesiredDir, const FVector& 
         const FVector RelVel2D = OtherVel2D - MyVel2D;
         const float RelVelSq = RelVel2D.SizeSquared();
 
-        // Closest approach within horizon
-        float t = 0.f;
+        float tClosest = 0.f;
         FVector ClosestVec = RelPos2D;
-
         if (RelVelSq > 25.f)
         {
-            t = -FVector::DotProduct(RelPos2D, RelVel2D) / RelVelSq;
-            t = FMath::Clamp(t, 0.f, Horizon);
-            ClosestVec = RelPos2D + RelVel2D * t;
+            tClosest = -FVector::DotProduct(RelPos2D, RelVel2D) / RelVelSq;
+            tClosest = FMath::Clamp(tClosest, 0.f, Horizon);
+            ClosestVec = RelPos2D + RelVel2D * tClosest;
         }
 
         const float ClosestDist = ClosestVec.Size();
 
-        // --- LOOKAHEAD (key) ---
-        // Make this *distance-based* so it still works at any speed
-        const float LookAhead = (CombinedRadius * (2.6f * SpeedFactor)) + (Speed * Horizon);
+        const float LookAhead = (CombinedRadius * (3.2f * SpeedFactor)) + (Speed * Horizon);
 
-        // Use the *minimum* of current and predicted edge distance (prevents “late wake-up”)
         const float EdgeNow = DistNow - CombinedRadius;
         const float EdgePred = ClosestDist - CombinedRadius;
         const float EdgeDist = FMath::Min(EdgeNow, EdgePred);
 
-        if (EdgeDist > LookAhead)
-            continue;
+        if (EdgeDist > LookAhead) continue;
 
-        // --- proximity (old feel) ---
         float Proximity = 1.f - FMath::Clamp(EdgeDist / LookAhead, 0.f, 1.f);
         Proximity = FMath::Pow(Proximity, 1.35f);
 
-        // --- near-field separation (prevents sticking) ---
-        // If we are very close, force stronger lateral slide using CURRENT direction.
-        const bool bVeryClose = (EdgeNow < CombinedRadius * 0.10f);
+        const bool bOverlapping = (EdgeNow < 0.f);
+        const bool bVeryClose = (EdgeNow < CombinedRadius * 0.45f);
 
-        FVector DirForSide = bVeryClose ? DirToOtherNow : ClosestVec.GetSafeNormal2D();
-        if (DirForSide.IsNearlyZero())
-            DirForSide = DirToOtherNow;
-
-        float SideSign = FVector::CrossProduct(ForwardDir, DirForSide).Z;
-
-        // Perfectly centered / ambiguous -> use bias
-        if (FMath::Abs(SideSign) < 0.03f)
-            SideSign = (float)AvoidanceSide;
-
-        FVector SideDir =
-            (SideSign >= 0.f)
-            ? FVector(ForwardDir.Y, -ForwardDir.X, 0.f)
-            : FVector(-ForwardDir.Y, ForwardDir.X, 0.f);
-
-        SideDir.Normalize();
-
-        float EmergencyBoost = FMath::GetMappedRangeValueClamped(
-            FVector2D(0.f, CombinedRadius * 0.6f),
-            FVector2D(1.55f, 1.0f),
-            EdgeDist
-        );
-
-        float SideWeight = Proximity * EmergencyBoost;
-
-        // Extra shove when extremely close (stuck fix)
+        // Separation: stronger when close/overlapping. This is what prevents "push through."
+        float SepW = 0.f;
         if (bVeryClose)
-            SideWeight = FMath::Max(SideWeight, 0.85f);
+        {
+            const float CloseAlpha = 1.f - FMath::Clamp(EdgeNow / FMath::Max(CombinedRadius * 0.45f, 1.f), 0.f, 1.f);
+            SepW = FMath::Clamp(0.40f + CloseAlpha * 1.05f, 0.f, 1.45f);
+        }
+        if (bOverlapping) SepW = FMath::Max(SepW, 1.30f);
 
-        AccumulatedSideDir += SideDir * SideWeight;
-        TotalSideWeight += SideWeight;
+        const FVector SepDir = (-DirToOtherNow).GetSafeNormal();
+        AccumSep += SepDir * SepW;
+        TotalSepW += SepW;
+
+        // Side passing (disabled in final-guard mode)
+        if (!bFinalGuard)
+        {
+            // We do NOT re-decide side each tick. We use committed side (below).
+            // Here we just measure "how much we want to pass" in general.
+            const float SideW = FMath::Clamp(Proximity, 0.f, 1.25f);
+            TotalSideW += SideW;
+        }
+
+        // Primary threat scoring (close + in front)
+        const float Score = (Proximity * 1.15f + SepW * 1.0f) * FMath::Clamp(ForwardDot + 0.25f, 0.f, 1.f);
+        if (Score > PrimaryScore)
+        {
+            PrimaryScore = Score;
+            Primary = Other;
+        }
     }
 
-    if (TotalSideWeight <= KINDA_SMALL_NUMBER)
-        return;
+    // If nothing nearby, keep going (but allow a short "linger" commitment to avoid flip-flop)
+    const bool bHasThreat = (Primary != nullptr);
 
-    const FVector FinalSideDir = AccumulatedSideDir.GetSafeNormal();
+    // -------------------------
+    // Commit to a side (HARD) to stop mirror wiggle
+    // -------------------------
+    const bool bCommitValid = (S.Side != 0 && S.Threat.IsValid() && Now < S.UntilTime);
 
-    float ClampedSideWeight = FMath::Clamp(TotalSideWeight, 0.f, 1.f);
-    float ForwardWeight = 1.f - ClampedSideWeight;
+    if (!bFinalGuard && bHasThreat)
+    {
+        // Refresh commitment if threat changed or expired
+        if (!bCommitValid || S.Threat.Get() != Primary)
+        {
+            S.Threat = Primary;
 
-    FVector NewDir = (ForwardDir * ForwardWeight) + (FinalSideDir * ClampedSideWeight);
+            // IMPORTANT: side is *stable per pair*, not based on noisy cross products.
+            // Both units compute the same pair sign; because their ForwardDir is opposite, "my left" becomes opposite world directions.
+            const int32 A = CharacterOwner->GetUniqueID();
+            const int32 B = Primary->GetUniqueID();
+            const int32 MinID = FMath::Min(A, B);
+            const int32 MaxID = FMath::Max(A, B);
+
+            // Stable pseudo-random bit from the pair (does not change frame-to-frame)
+            const uint32 PairHash = HashCombineFast((uint32)MinID, (uint32)MaxID);
+            S.Side = ((PairHash & 1u) == 0u) ? +1 : -1;
+
+            // Commit longer to prevent flip-flop
+            S.UntilTime = Now + FMath::Clamp(0.55f + 0.20f * SpeedFactor, 0.55f, 1.05f);
+        }
+    }
+    else
+    {
+        // If no threat, let commitment decay naturally (don’t instantly drop to 0 or you’ll oscillate).
+    }
+
+    // -------------------------
+    // Deadlock breaker (the real fix for infinite mirror-lock)
+    // If we're stuck for long enough near a threat, force ONE unit to yield briefly.
+    // -------------------------
+    if (S.StuckTime > 0.35f && bHasThreat)
+    {
+        // Deterministic: higher ID yields (so only one yields)
+        const int32 MeID = CharacterOwner->GetUniqueID();
+        const int32 OtherID = Primary->GetUniqueID();
+
+        if (MeID > OtherID)
+        {
+            S.YieldUntilTime = Now + 0.35f;   // short yield window
+        }
+
+        // Reset stuck time so we don't spam yield forever
+        S.StuckTime = 0.f;
+    }
+
+    // -------------------------
+    // Build final steering vector
+    // -------------------------
+    FVector SepN = AccumSep.IsNearlyZero() ? FVector::ZeroVector : AccumSep.GetSafeNormal();
+
+    // If final-guard: do NOT do lateral passing (prevents orbiting around occupied goal)
+    FVector SideN = FVector::ZeroVector;
+    float SideBlend = 0.f;
+
+    if (!bFinalGuard && (bCommitValid || (S.Side != 0 && Now < S.UntilTime)))
+    {
+        SideN = (S.Side > 0)
+            ? FVector(ForwardDir.Y, -ForwardDir.X, 0.f)
+            : FVector(-ForwardDir.Y, ForwardDir.X, 0.f);
+        SideN.Normalize();
+
+        SideBlend = FMath::Clamp(TotalSideW, 0.f, 1.f);
+
+        // If yielding, we *don’t* try to pass; we mostly step aside (lets other go through)
+        if (bYielding)
+        {
+            SideBlend = FMath::Max(SideBlend, 0.80f);
+        }
+    }
+
+    float SepBlend = FMath::Clamp(TotalSepW, 0.f, 1.f);
+
+    // Forward damping:
+    // - If very close, separation dominates and forward drops so we stop "pushing through".
+    // - If yielding, forward drops even more.
+    float ForwardBlend = 1.f - FMath::Clamp(SepBlend * 0.85f + SideBlend * 0.70f, 0.f, bYielding ? 0.98f : 0.92f);
+
+    FVector NewDir = ForwardDir * ForwardBlend;
+    if (!SideN.IsNearlyZero()) NewDir += SideN * SideBlend;
+    if (!SepN.IsNearlyZero())  NewDir += SepN * SepBlend;
+
     FVector FinalDir = NewDir.GetSafeNormal();
+    if (FinalDir.IsNearlyZero()) return;
 
-    // Forward-only motion
+    // No backwards
     if (FVector::DotProduct(FinalDir, ForwardDir) <= 0.f)
-        return;
+    {
+        // prefer sideways/separation fallback
+        if (!SepN.IsNearlyZero()) FinalDir = (SepN + ForwardDir * 0.10f).GetSafeNormal();
+        else if (!SideN.IsNearlyZero()) FinalDir = (SideN + ForwardDir * 0.10f).GetSafeNormal();
+        else return;
+    }
 
-    // --- smoothing (removes clunky “shove”) ---
-    // Keeps constant speed; only smooths direction changes.
+    // Less smoothing to avoid "synchronized oscillation"
     if (!PrevAvoidDir2D.IsNearlyZero())
     {
-        FinalDir = (PrevAvoidDir2D * 0.70f + FinalDir * 0.30f).GetSafeNormal();
+        FinalDir = (PrevAvoidDir2D * 0.45f + FinalDir * 0.55f).GetSafeNormal();
     }
     PrevAvoidDir2D = FinalDir;
 
