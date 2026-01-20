@@ -835,26 +835,29 @@ void UUnitMovementComponent::OldApplyAvoidance(FVector& DesiredDir, const FVecto
     DesiredDir = NewDir.GetSafeNormal();
 }
 
-//SoftCollision - V1
+//SoftCollision - V10
 void UUnitMovementComponent::SoftCollision(FVector& InOutDesiredDir, const FVector& MyPos, float DeltaTime)
 {
     if (!bEnableSoftCollision) return;
     if (!CharacterOwner || !CapComp || !GetWorld()) return;
 
-    // 2D forward dir (what we're trying to do this tick)
+    // Forward intent (2D)
     FVector Forward2D(InOutDesiredDir.X, InOutDesiredDir.Y, 0.f);
-    const bool bHasForward = !Forward2D.IsNearlyZero();
-    Forward2D = bHasForward ? Forward2D.GetSafeNormal() : FVector::ForwardVector;
+    if (Forward2D.IsNearlyZero()) return;
+    Forward2D = Forward2D.GetSafeNormal();
 
     const FVector CapCenter = CapComp->GetComponentLocation();
-    const float CapRadius = CapComp->GetScaledCapsuleRadius();
-    const float CapHalfHeight = CapComp->GetScaledCapsuleHalfHeight();
+    const float   CapRadius = CapComp->GetScaledCapsuleRadius();
+    const float   CapHalf = CapComp->GetScaledCapsuleHalfHeight();
 
-    // --- overlap query: SAME IDEA as your debug clipping visualizer ---
+    // Early warning buffer (keep aggressive-ish but not insane)
+    const float BasePre = FMath::Clamp(UnitRadius * 0.20f, 6.f, 16.f);
+    const float PreBuffer = BasePre;
+    const float QueryRadius = CapRadius + PreBuffer;
+
+    // Overlap query
     TArray<FOverlapResult> Hits;
     FCollisionQueryParams Params(SCENE_QUERY_STAT(SoftCollisionOverlap), true, CharacterOwner);
-
-    // If you want to include physics bodies too, mirror your avoidance ObjQuery style.
     FCollisionObjectQueryParams ObjQuery;
     ObjQuery.AddObjectTypesToQuery(ECC_Pawn);
 
@@ -863,29 +866,35 @@ void UUnitMovementComponent::SoftCollision(FVector& InOutDesiredDir, const FVect
         CapCenter,
         FQuat::Identity,
         ObjQuery,
-        FCollisionShape::MakeCapsule(CapRadius, CapHalfHeight),
+        FCollisionShape::MakeCapsule(QueryRadius, CapHalf),
         Params
     );
 
     if (!bAny || Hits.Num() == 0) return;
 
-    // Accumulate separation away from overlapped actors (2D)
-    FVector SepAccum2D = FVector::ZeroVector;
-    int32 ContribCount = 0;
+    // Spacing buffer (log10)
+    const float SafeRadius = FMath::Max(UnitRadius, 1.f);
+    const float Buffer = ExtraBuffer + (5.f * FMath::LogX(10.f, SafeRadius));
+
+    FVector SepSum2D = FVector::ZeroVector;
+    float TotalW = 0.f;
+
+    bool bAnyTrueOverlap = false;
+    float MaxOverlapT = 0.f;
+    float MaxPreT = 0.f;
+
+    FVector StrongestAway2D = FVector::ZeroVector;
+    float StrongestPen = 0.f;
 
     for (const FOverlapResult& H : Hits)
     {
         AActor* Other = H.GetActor();
         if (!Other || Other == CharacterOwner) continue;
-
-        // Ignore our move target if you consider it "allowed" to overlap (optional)
         if (MoveTargetActor.IsValid() && Other == MoveTargetActor.Get()) continue;
 
-        // Compute desired separation distance based on radii
-        float SafeRadius = FMath::Max(UnitRadius, 1.f);
-        float Buffer = ExtraBuffer + (5.f * FMath::LogX(10.f, SafeRadius));
-        const float OtherRadius = SetOtherRadius(Other); // you already have this helper in the component
+        const float OtherRadius = SetOtherRadius(Other);
         const float DesiredSep = UnitRadius + OtherRadius + Buffer;
+        const float ReactDist = DesiredSep + PreBuffer;
 
         const FVector OtherPos = Other->GetActorLocation();
         FVector Delta2D(CapCenter.X - OtherPos.X, CapCenter.Y - OtherPos.Y, 0.f);
@@ -893,63 +902,125 @@ void UUnitMovementComponent::SoftCollision(FVector& InOutDesiredDir, const FVect
         float Dist2D = Delta2D.Size();
         if (Dist2D < KINDA_SMALL_NUMBER)
         {
-            // Perfectly stacked: push in a stable direction (side bias)
             Delta2D = FVector(0.f, (float)AvoidanceSide, 0.f);
             Dist2D = 1.f;
         }
 
-        // If we're within desired sep, push out proportionally
+        if (Dist2D >= ReactDist) continue;
+
+        const FVector AwayDir = (Delta2D / Dist2D);
+
+        float W = 0.f;
+
         if (Dist2D < DesiredSep)
         {
-            const float Penetration = (DesiredSep - Dist2D);
+            bAnyTrueOverlap = true;
 
-            // Direction away from the other
-            const FVector AwayDir = Delta2D / Dist2D;
+            const float Pen = (DesiredSep - Dist2D); // world units
+            if (Pen > StrongestPen)
+            {
+                StrongestPen = Pen;
+                StrongestAway2D = AwayDir;
+            }
 
-            // Weight: deeper overlap => stronger
-            const float Weight = FMath::Clamp(Penetration / FMath::Max(DesiredSep, 1.f), 0.f, 1.f);
+            float t = Pen / FMath::Max(DesiredSep, 1.f);
+            t = FMath::Clamp(t, 0.f, 1.f);
+            MaxOverlapT = FMath::Max(MaxOverlapT, t);
 
-            SepAccum2D += AwayDir * Weight;
-            ContribCount++;
+            // Still strong, but slightly less "brick wall" than V9
+            W = FMath::Pow(t, 1.35f) * 4.6f; // V9 was ~Pow 1.2 * 6.0
+        }
+        else
+        {
+            float t = (ReactDist - Dist2D) / FMath::Max(PreBuffer, 1.f);
+            t = FMath::Clamp(t, 0.f, 1.f);
+            MaxPreT = FMath::Max(MaxPreT, t);
+
+            // Prebuffer guidance: slightly gentler to reduce twitch
+            W = FMath::Pow(t, 1.0f) * 0.9f; // V9 was 1.2
+        }
+
+        SepSum2D += AwayDir * W;
+        TotalW += W;
+    }
+
+    if (TotalW <= KINDA_SMALL_NUMBER || SepSum2D.IsNearlyZero()) return;
+
+    FVector SepDir2D = (SepSum2D / TotalW).GetSafeNormal();
+
+    // Never push backwards
+    const float BackDot = FVector::DotProduct(SepDir2D, Forward2D);
+    if (BackDot < 0.f)
+    {
+        SepDir2D -= Forward2D * BackDot;
+        if (SepDir2D.IsNearlyZero()) return;
+        SepDir2D = SepDir2D.GetSafeNormal();
+    }
+
+    // ---------------------------
+    // Micro depenetration (softened)
+    // Allow a tiny tolerated overlap before pushing out.
+    // ---------------------------
+    if (bAnyTrueOverlap && StrongestPen > 0.f && !StrongestAway2D.IsNearlyZero())
+    {
+        // Tolerate a tiny penetration ("95% hardness")
+        const float PenTolerance = FMath::Max(1.5f, UnitRadius * 0.03f); // ~0.9 units for R=30, clamped up to 1.5
+        const float ExcessPen = StrongestPen - PenTolerance;
+
+        if (ExcessPen > 0.f)
+        {
+            const float PushFrac = 0.45f; // V9 was 0.60 (softer)
+            const float MaxPush = FMath::Max(1.5f, UnitRadius * 0.14f); // V9 was 0.20 (softer cap)
+
+            const float PushDist = FMath::Min(ExcessPen * PushFrac, MaxPush);
+            const FVector PushDelta = FVector(StrongestAway2D.X, StrongestAway2D.Y, 0.f) * PushDist;
+
+            FHitResult Hit;
+            CapComp->MoveComponent(PushDelta, CapComp->GetComponentQuat(), true, &Hit);
         }
     }
 
-    if (ContribCount == 0 || SepAccum2D.IsNearlyZero()) return;
+    // ---------------------------
+    // Steering (softened a bit)
+    // ---------------------------
+    float Blend = SoftCollisionBlend;
 
-    SepAccum2D /= (float)ContribCount;
-    SepAccum2D = SepAccum2D.GetSafeNormal();
-
-    // --- prevent "moving backwards" ---
-    // Remove any component that points behind our forward direction
-    const float BackDot = FVector::DotProduct(SepAccum2D, Forward2D);
-    if (BackDot < 0.f)
+    if (bAnyTrueOverlap)
     {
-        // subtract the backwards component so we only push sideways/forward
-        SepAccum2D -= Forward2D * BackDot;
-        if (SepAccum2D.IsNearlyZero()) return;
-        SepAccum2D = SepAccum2D.GetSafeNormal();
+        // not quite "absolute wall" anymore
+        Blend = FMath::Max(Blend, 0.86f);     // V9 used ~0.92+
+        Blend += MaxOverlapT * 0.06f;
+    }
+    else
+    {
+        Blend += MaxPreT * 0.20f;
+        Blend = FMath::Clamp(Blend, 0.f, 0.65f);
     }
 
-    // Blend separation into desired dir
-    const float Blend = FMath::Clamp(SoftCollisionBlend, 0.f, 1.f);
-    FVector NewDir2D = (Forward2D * (1.f - Blend)) + (SepAccum2D * Blend);
+    Blend = FMath::Clamp(Blend, 0.f, 0.95f);
 
-    if (!NewDir2D.IsNearlyZero())
+    FVector NewDir2D = (Forward2D * (1.f - Blend)) + (SepDir2D * Blend);
+    if (NewDir2D.IsNearlyZero()) return;
+    NewDir2D = NewDir2D.GetSafeNormal();
+
+    // Final safety
+    if (FVector::DotProduct(NewDir2D, Forward2D) <= 0.f)
     {
-        NewDir2D = NewDir2D.GetSafeNormal();
-        InOutDesiredDir = FVector(NewDir2D.X, NewDir2D.Y, 0.f);
+        NewDir2D = (SepDir2D + Forward2D * 0.10f).GetSafeNormal();
+        if (NewDir2D.IsNearlyZero()) return;
     }
 
-    // Optional debug
+    InOutDesiredDir = FVector(NewDir2D.X, NewDir2D.Y, 0.f);
+
     if (bDebugSoftCollision)
     {
         const float Z = CapCenter.Z;
-        DrawDebugCapsule(GetWorld(), CapCenter, CapHalfHeight, CapRadius, FQuat::Identity,
+        DrawDebugCapsule(GetWorld(), CapCenter, CapHalf, QueryRadius, FQuat::Identity,
             FColor::Yellow, false, 0.05f, 0, 1.5f);
 
         DrawDebugLine(GetWorld(),
             FVector(CapCenter.X, CapCenter.Y, Z),
-            FVector(CapCenter.X, CapCenter.Y, Z) + (SepAccum2D * SoftCollisionDebugLen),
+            FVector(CapCenter.X, CapCenter.Y, Z) + (SepDir2D * SoftCollisionDebugLen),
             FColor::Yellow, false, 0.05f, 0, 2.f);
     }
 }

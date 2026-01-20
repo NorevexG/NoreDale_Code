@@ -106,8 +106,12 @@ protected:
 
     FVector CurrentGoal = FVector::ZeroVector;
 
-    //temp for version 5 avoidance
+    //temp for version 5-9 apply avoidance
     FVector PrevAvoidDir2D = FVector::ZeroVector;
+
+    //used in SoftCollision V7
+    bool bSoftCol_WasOverlapping = false;
+    float SoftCol_EntryBoostTimer = 0.f;
 
     // Build navigation path
     bool BuildPathToLocation(const FVector& TargetLocation);
