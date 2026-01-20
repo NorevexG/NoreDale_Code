@@ -199,12 +199,11 @@ bool UUnitMovementComponent::TickMoveAlongPath(float DeltaTime)
     return false;
 }
 
-// Reworked Version 4
+// Reworked Version 6
 bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& MyPos, float DeltaTime)
 {
     bool bGoalAdjusted = false;
-    if (!CharacterOwner)
-        return bGoalAdjusted;
+    if (!CharacterOwner) return bGoalAdjusted;
 
     // --- setup ---
     FVector ToGoal = CurrentGoal - MyPos;
@@ -224,6 +223,7 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
         PointA3D = InternalPathPoints[CurrentPathIndex];
 
     const FVector PointA2D(PointA3D.X, PointA3D.Y, 0.f);
+
     FVector DirA2D = (PointA2D - MyPos2D);
     float DistToA = DirA2D.Size();
     DirA2D = (DistToA > KINDA_SMALL_NUMBER) ? (DirA2D / DistToA) : FVector::ZeroVector;
@@ -265,7 +265,7 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
     FVector ForwardEnd = (LenB > 0.f) ? EndB : EndA;
 
     // Detection state
-    bool bDetectedAny = false;     // FIX: any valid unit in overlap -> BLUE
+    bool bDetectedAny = false; // FIX: any valid unit in overlap -> BLUE
     bool bBlockingPath = false;
     FColor ForwardColor = FColor::Green;
 
@@ -301,19 +301,19 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
         }
 
         FVector Dir = SE / SegLen;
-        float t = FVector::DotProduct((P - S), Dir);      // distance-along in world units
+        float t = FVector::DotProduct((P - S), Dir); // distance-along in world units
         t = FMath::Clamp(t, 0.f, SegLen);
 
         OutAlong = t;
         OutClosest = S + Dir * t;
     };
 
+    // Side detection removed: this is now ONLY hard corridor intersection.
     auto TestSegment = [&](AActor* Other,
         const FVector& SegStart,
         const FVector& SegEnd,
         float SegLen,
         float CombinedRadius,
-        bool bEnableSideInflow,
         bool& bOutInFront) -> bool
     {
         bOutInFront = false;
@@ -337,49 +337,16 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
         FVector Delta = Other2D - Closest;
         float PerpDist = Delta.Size();
 
-        // Hard blocking: inside corridor radius
+        // Hard blocking: inside corridor radius and in-front
         if (PerpDist <= CombinedRadius && bOutInFront)
             return true;
 
-        if (!bEnableSideInflow || !bOutInFront)
-            return false;
-
-        // --- side inflow (conservative gates) ---
-        // Gate 1: must be just outside corridor boundary
-        const float InflowMargin = 60.f;                 // tune: 25-75
-        if (PerpDist <= CombinedRadius || PerpDist > (CombinedRadius + InflowMargin))
-            return false;
-
-        // Gate 3: only care within a short "near window" along the segment
-        const float NearWindowLen = FMath::Clamp(FMath::Max(150.f, UnitRadius * 4.f), 50.f, Range);
-        if (RawAlong > NearWindowLen)
-            return false;
-
-        // Gate 2: must be moving inward toward corridor meaningfully
-        FVector OtherVel2D = Other->GetVelocity();
-        OtherVel2D.Z = 0.f;
-
-        if (OtherVel2D.SizeSquared() < 25.f) // essentially stationary
-            return false;
-
-        FVector N = Delta.GetSafeNormal(); // from corridor to actor
-        float InwardSpeed = FVector::DotProduct(OtherVel2D, -N);
-
-        const float InflowSpeedThreshold = 50.f;         // tune: 25-100
-        if (InwardSpeed <= InflowSpeedThreshold)
-            return false;
-
-        return true;
+        return false;
     };
 
     // --- main loop ---
     if (bAny && Overlaps.Num() > 0)
     {
-        // Choose which segment gets side-inflow.
-        // Recommended: only on segment A to reduce false positives around corners.
-        const bool bEnableSideInflowOnA = true;
-        const bool bEnableSideInflowOnB = false;
-
         for (const FOverlapResult& R : Overlaps)
         {
             AActor* Other = R.GetActor();
@@ -390,14 +357,13 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
             const FVector ToOther2D(OtherLoc.X - MyPos.X, OtherLoc.Y - MyPos.Y, 0.f);
             if (ToOther2D.SizeSquared() < 1.f) continue;
 
-            // FIX: "detected something" should be true as soon as we accept a valid Other
+            // "detected something" is true as soon as we accept a valid Other (blue)
             bDetectedAny = true;
 
             float OtherRadius = SetOtherRadius(Other);
             float CombinedRadius = UnitRadius + OtherRadius + ExtraBuffer;
 
-            // FIX: On final goal, treat "goal within combined radius" as blocking,
-            // even if corridor math misses it.
+            // Final-goal proximity blocking (kept)
             if (bIsFinalPoint)
             {
                 const FVector Other2D(OtherLoc.X, OtherLoc.Y, 0.f);
@@ -406,15 +372,15 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
                 if (GoalDist <= CombinedRadius)
                 {
                     BlockingActors.AddUnique(Other);
-                    continue; // already blocking; no need for segment tests
+                    continue;
                 }
             }
 
             bool bInFrontA = false;
             bool bInFrontB = false;
 
-            bool bBlockA = TestSegment(Other, StartA, EndA, LenA, CombinedRadius, bEnableSideInflowOnA, bInFrontA);
-            bool bBlockB = (LenB > 0.f) ? TestSegment(Other, StartB, EndB, LenB, CombinedRadius, bEnableSideInflowOnB, bInFrontB) : false;
+            bool bBlockA = TestSegment(Other, StartA, EndA, LenA, CombinedRadius, bInFrontA);
+            bool bBlockB = (LenB > 0.f) ? TestSegment(Other, StartB, EndB, LenB, CombinedRadius, bInFrontB) : false;
 
             if (bBlockA || bBlockB)
             {
@@ -472,57 +438,13 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
         }
     }
 
-    // FIX: Blue means "any detected", Red means "blocking", Green means "none"
+    // Blue/Red/Green as requested
     if (bBlockingPath) ForwardColor = FColor::Red;
     else if (bDetectedAny) ForwardColor = FColor::Blue;
     else ForwardColor = FColor::Green;
 
     if (bDebugAvoidance)
     {
-        // On-screen debug prints (requires #include "Engine/Engine.h")
-        if (GEngine)
-        {
-            const float Duration = 1.25f;
-
-            // One line: corridor info
-            GEngine->AddOnScreenDebugMessage(
-                9001, Duration, FColor::White,
-                FString::Printf(TEXT("AvoidCheck | idx %d/%d final=%d | Range=%.0f DistToA=%.0f LenA=%.0f LenB=%.0f"),
-                    CurrentPathIndex,
-                    InternalPathPoints.Num(),
-                    bIsFinalPoint ? 1 : 0,
-                    Range, DistToA, LenA, LenB)
-            );
-
-            // One line: detection summary
-            GEngine->AddOnScreenDebugMessage(
-                9002, Duration, FColor::White,
-                FString::Printf(TEXT("Detect | Any=%d Blocking=%d BlockingActors=%d Overlaps=%d"),
-                    bDetectedAny ? 1 : 0,
-                    bBlockingPath ? 1 : 0,
-                    BlockingActors.Num(),
-                    Overlaps.Num())
-            );
-
-            // One line: final goal distance (helps confirm the edge-click case)
-            if (bIsFinalPoint)
-            {
-                GEngine->AddOnScreenDebugMessage(
-                    9003, Duration, FColor::White,
-                    FString::Printf(TEXT("FinalGoal | DistToGoal2D=%.0f  UnitR=%.0f  ExtraBuffer=%.0f"),
-                        DistToGoal, UnitRadius, ExtraBuffer)
-                );
-            }
-            else
-            {
-                GEngine->AddOnScreenDebugMessage(
-                    9003, Duration, FColor::White,
-                    FString::Printf(TEXT("NonFinal | DistToGoal2D=%.0f"), DistToGoal)
-                );
-            }
-        }
-
-        // Your existing debug line (KEEP constant length)
         float Z = CharacterOwner->GetActorLocation().Z;
         if (CapComp)
         {
@@ -537,6 +459,7 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
 
         DrawDebugLine(GetWorld(), Start, End, ForwardColor, false, 0.05f, 0, 4.f);
     }
+
     /*-----------------------------------------DEBUG----------------------------------------------------*/
 
     return bGoalAdjusted;
