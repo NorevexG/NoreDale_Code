@@ -185,6 +185,8 @@ bool UUnitMovementComponent::TickMoveAlongPath(float DeltaTime)
     if (bGoalAdjusted)
         return false;
 
+    SoftCollision(DesiredDir, Pos, DeltaTime);
+
     if (MoveComp)
     {
         if (MoveComp->MovementMode == MOVE_None)
@@ -831,6 +833,125 @@ void UUnitMovementComponent::OldApplyAvoidance(FVector& DesiredDir, const FVecto
         (SideDir * SideWeight);
 
     DesiredDir = NewDir.GetSafeNormal();
+}
+
+//SoftCollision - V1
+void UUnitMovementComponent::SoftCollision(FVector& InOutDesiredDir, const FVector& MyPos, float DeltaTime)
+{
+    if (!bEnableSoftCollision) return;
+    if (!CharacterOwner || !CapComp || !GetWorld()) return;
+
+    // 2D forward dir (what we're trying to do this tick)
+    FVector Forward2D(InOutDesiredDir.X, InOutDesiredDir.Y, 0.f);
+    const bool bHasForward = !Forward2D.IsNearlyZero();
+    Forward2D = bHasForward ? Forward2D.GetSafeNormal() : FVector::ForwardVector;
+
+    const FVector CapCenter = CapComp->GetComponentLocation();
+    const float CapRadius = CapComp->GetScaledCapsuleRadius();
+    const float CapHalfHeight = CapComp->GetScaledCapsuleHalfHeight();
+
+    // --- overlap query: SAME IDEA as your debug clipping visualizer ---
+    TArray<FOverlapResult> Hits;
+    FCollisionQueryParams Params(SCENE_QUERY_STAT(SoftCollisionOverlap), true, CharacterOwner);
+
+    // If you want to include physics bodies too, mirror your avoidance ObjQuery style.
+    FCollisionObjectQueryParams ObjQuery;
+    ObjQuery.AddObjectTypesToQuery(ECC_Pawn);
+
+    const bool bAny = GetWorld()->OverlapMultiByObjectType(
+        Hits,
+        CapCenter,
+        FQuat::Identity,
+        ObjQuery,
+        FCollisionShape::MakeCapsule(CapRadius, CapHalfHeight),
+        Params
+    );
+
+    if (!bAny || Hits.Num() == 0) return;
+
+    // Accumulate separation away from overlapped actors (2D)
+    FVector SepAccum2D = FVector::ZeroVector;
+    int32 ContribCount = 0;
+
+    for (const FOverlapResult& H : Hits)
+    {
+        AActor* Other = H.GetActor();
+        if (!Other || Other == CharacterOwner) continue;
+
+        // Ignore our move target if you consider it "allowed" to overlap (optional)
+        if (MoveTargetActor.IsValid() && Other == MoveTargetActor.Get()) continue;
+
+        // Compute desired separation distance based on radii
+        float SafeRadius = FMath::Max(UnitRadius, 1.f);
+        float Buffer = ExtraBuffer + (5.f * FMath::LogX(10.f, SafeRadius));
+        const float OtherRadius = SetOtherRadius(Other); // you already have this helper in the component
+        const float DesiredSep = UnitRadius + OtherRadius + Buffer;
+
+        const FVector OtherPos = Other->GetActorLocation();
+        FVector Delta2D(CapCenter.X - OtherPos.X, CapCenter.Y - OtherPos.Y, 0.f);
+
+        float Dist2D = Delta2D.Size();
+        if (Dist2D < KINDA_SMALL_NUMBER)
+        {
+            // Perfectly stacked: push in a stable direction (side bias)
+            Delta2D = FVector(0.f, (float)AvoidanceSide, 0.f);
+            Dist2D = 1.f;
+        }
+
+        // If we're within desired sep, push out proportionally
+        if (Dist2D < DesiredSep)
+        {
+            const float Penetration = (DesiredSep - Dist2D);
+
+            // Direction away from the other
+            const FVector AwayDir = Delta2D / Dist2D;
+
+            // Weight: deeper overlap => stronger
+            const float Weight = FMath::Clamp(Penetration / FMath::Max(DesiredSep, 1.f), 0.f, 1.f);
+
+            SepAccum2D += AwayDir * Weight;
+            ContribCount++;
+        }
+    }
+
+    if (ContribCount == 0 || SepAccum2D.IsNearlyZero()) return;
+
+    SepAccum2D /= (float)ContribCount;
+    SepAccum2D = SepAccum2D.GetSafeNormal();
+
+    // --- prevent "moving backwards" ---
+    // Remove any component that points behind our forward direction
+    const float BackDot = FVector::DotProduct(SepAccum2D, Forward2D);
+    if (BackDot < 0.f)
+    {
+        // subtract the backwards component so we only push sideways/forward
+        SepAccum2D -= Forward2D * BackDot;
+        if (SepAccum2D.IsNearlyZero()) return;
+        SepAccum2D = SepAccum2D.GetSafeNormal();
+    }
+
+    // Blend separation into desired dir
+    const float Blend = FMath::Clamp(SoftCollisionBlend, 0.f, 1.f);
+    FVector NewDir2D = (Forward2D * (1.f - Blend)) + (SepAccum2D * Blend);
+
+    if (!NewDir2D.IsNearlyZero())
+    {
+        NewDir2D = NewDir2D.GetSafeNormal();
+        InOutDesiredDir = FVector(NewDir2D.X, NewDir2D.Y, 0.f);
+    }
+
+    // Optional debug
+    if (bDebugSoftCollision)
+    {
+        const float Z = CapCenter.Z;
+        DrawDebugCapsule(GetWorld(), CapCenter, CapHalfHeight, CapRadius, FQuat::Identity,
+            FColor::Yellow, false, 0.05f, 0, 1.5f);
+
+        DrawDebugLine(GetWorld(),
+            FVector(CapCenter.X, CapCenter.Y, Z),
+            FVector(CapCenter.X, CapCenter.Y, Z) + (SepAccum2D * SoftCollisionDebugLen),
+            FColor::Yellow, false, 0.05f, 0, 2.f);
+    }
 }
 
 //GoalAdjustment

@@ -52,6 +52,19 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Avoidance|Debug")
     float ExtraBuffer = 0.f;
 
+    // Soft Collision
+    UPROPERTY(EditAnywhere, Category = "Soft Collision")
+    bool bEnableSoftCollision = true;
+
+    UPROPERTY(EditAnywhere, Category = "Soft Collision", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float SoftCollisionBlend = 0.35f; // how much we bend toward separation
+
+    UPROPERTY(EditAnywhere, Category = "Soft Collision|Debug")
+    bool bDebugSoftCollision = false;
+
+    UPROPERTY(EditAnywhere, Category = "Soft Collision|Debug")
+    float SoftCollisionDebugLen = 120.f;
+
     // ---------- Blueprint-callable API ----------
     UFUNCTION(BlueprintCallable, Category = "Movement")
     void RefreshMovementData();
@@ -109,6 +122,9 @@ protected:
     void ApplyAvoidance(FVector& DesiredDir, const FVector& MyPos, TArray<AActor*> NearActors);
 
     void OldApplyAvoidance(FVector& DesiredDir, const FVector& MyPos, const FVector& OtherPos, float OtherRadius);
+
+    //SoftCollision
+    void SoftCollision(FVector& InOutDesiredDir, const FVector& MyPos, float DeltaTime);
 
     //GoalAdjustments
     bool GoalAdjustment();
