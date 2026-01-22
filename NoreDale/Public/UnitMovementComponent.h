@@ -113,6 +113,13 @@ protected:
     bool bSoftCol_WasOverlapping = false;
     float SoftCol_EntryBoostTimer = 0.f;
 
+
+    //temp AvoidanceCheck v6
+    float Avoid_InitialLockRemaining = 0.f;
+    TWeakObjectPtr<AActor> Avoid_LockedDominant;
+    float Avoid_RecentBlockRemaining = 0.f;
+
+
     // Build navigation path
     bool BuildPathToLocation(const FVector& TargetLocation);
 
@@ -122,10 +129,9 @@ protected:
     // Debug-only detection (no steering)
     bool AvoidanceCheck(FVector& DesiredDir, const FVector& MyPos, float DeltaTime);
 
-    //ApplyAvoidance
-    void ApplyAvoidance(FVector& DesiredDir, const FVector& MyPos, TArray<AActor*> NearActors);
+    //InitialAvoidance
 
-    void OldApplyAvoidance(FVector& DesiredDir, const FVector& MyPos, const FVector& OtherPos, float OtherRadius);
+    //EmergancyAvoidance
 
     //SoftCollision
     void SoftCollision(FVector& InOutDesiredDir, const FVector& MyPos, float DeltaTime);
