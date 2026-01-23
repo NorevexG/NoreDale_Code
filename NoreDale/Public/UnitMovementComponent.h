@@ -112,13 +112,32 @@ protected:
     //used in SoftCollision V7
     bool bSoftCol_WasOverlapping = false;
     float SoftCol_EntryBoostTimer = 0.f;
-
+    //Temp Soft Collision V11
+    float Soft_HoldRemaining = 0.f;
+    FVector Soft_LastSepDir2D = FVector::ZeroVector;
+    float Soft_LastSepWeight = 0.f;
 
     //temp AvoidanceCheck v6
     float Avoid_InitialLockRemaining = 0.f;
     TWeakObjectPtr<AActor> Avoid_LockedDominant;
     float Avoid_RecentBlockRemaining = 0.f;
 
+
+    //Temp New InitialAvoidance V2
+    TWeakObjectPtr<AActor> IA_Target;
+    int32 IA_SideSign = 0;
+    float IA_MinDist = BIG_NUMBER;
+    // v4 additions
+    FVector IA_BaseDir2D = FVector::ZeroVector;  
+    bool IA_bReleasing = false;
+    float IA_ReleaseAlpha = 1.f;
+    FVector IA_LastAvoidDir2D = FVector::ZeroVector;
+
+    //Debug Variables
+    FColor ForwardColor;
+
+    //DebugTools
+    void DebugTools(const FVector& FinalDir, const FVector& MyPos);
 
     // Build navigation path
     bool BuildPathToLocation(const FVector& TargetLocation);
@@ -130,11 +149,12 @@ protected:
     bool AvoidanceCheck(FVector& DesiredDir, const FVector& MyPos, float DeltaTime);
 
     //InitialAvoidance
+    void InitialAvoidance(FVector& DesiredDir, const FVector& MyPos, AActor* DominantBlocker);
 
     //EmergancyAvoidance
 
     //SoftCollision
-    void SoftCollision(FVector& InOutDesiredDir, const FVector& MyPos, float DeltaTime);
+    bool SoftCollision(const FVector& ForwardDir, const FVector& MyPos, float DeltaTime, FVector& OutMoveDir2D);
 
     //GoalAdjustments
     bool GoalAdjustment();
