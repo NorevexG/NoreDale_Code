@@ -10,6 +10,15 @@ class ACharacter;
 class UCapsuleComponent;
 class UCharacterMovementComponent;
 
+UENUM(BlueprintType)
+enum class ESteeringAuthority : uint8
+{
+    None            UMETA(DisplayName = "None"),
+    PathFollowing   UMETA(DisplayName = "Path Following"),
+    InitialAvoidance UMETA(DisplayName = "Initial Avoidance"),
+    SoftCollision   UMETA(DisplayName = "Soft Collision")
+};
+
 UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent), Blueprintable)
 class NOREDALE_API UUnitMovementComponent : public UActorComponent
 {
@@ -87,6 +96,8 @@ public:
 protected:
 
     // ---------- Path Data ----------
+    UPROPERTY(VisibleAnywhere, Category = "Steering")
+    ESteeringAuthority SteeringAuthority = ESteeringAuthority::PathFollowing;
 
     UPROPERTY(Transient)
     TArray<FVector> InternalPathPoints;
@@ -154,7 +165,7 @@ protected:
     //EmergancyAvoidance
 
     //SoftCollision
-    bool SoftCollision(const FVector& ForwardDir, const FVector& MyPos, float DeltaTime, FVector& OutMoveDir2D);
+    bool SoftCollision(FVector& DesiredDir, const FVector& MyPos, float DeltaTime);
 
     //GoalAdjustments
     bool GoalAdjustment();
