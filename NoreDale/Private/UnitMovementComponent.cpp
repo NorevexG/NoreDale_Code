@@ -151,7 +151,6 @@ bool UUnitMovementComponent::TickMoveAlongPath(float DeltaTime)
     {
         FVector Next = InternalPathPoints[CurrentPathIndex];
         FVector ToNext = Next - Pos;
-
         float Dist2D = FVector(ToNext.X, ToNext.Y, 0.f).Size();
 
         if (Dist2D > UnitRadius * AcceptanceModifier)
@@ -191,7 +190,13 @@ bool UUnitMovementComponent::TickMoveAlongPath(float DeltaTime)
     if (bGoalAdjusted)
         return false;
 
-    if (SoftCollision(DesiredDir, Pos, DeltaTime))
+    FVector SoftMoveDir = FVector::ZeroVector;
+    const bool bSoft = SoftCollision(DesiredDir, Pos, DeltaTime, SoftMoveDir);
+    FVector FinalDir = (bSoft && !SoftMoveDir.IsNearlyZero()) ? SoftMoveDir : DesiredDir;
+    if (FinalDir.IsNearlyZero())
+        FinalDir = DesiredDir;
+
+    if (bSoft)
     {
         SteeringAuthority = ESteeringAuthority::SoftCollision;
     }
@@ -200,7 +205,7 @@ bool UUnitMovementComponent::TickMoveAlongPath(float DeltaTime)
         SteeringAuthority = ESteeringAuthority::PathFollowing;
     }
 
-    DebugTools(DesiredDir, Pos);
+    DebugTools(FinalDir, Pos);
 
     if (MoveComp)
     {
@@ -210,14 +215,14 @@ bool UUnitMovementComponent::TickMoveAlongPath(float DeltaTime)
         MoveComp->MaxWalkSpeed = MoveSpeed;
     }
 
-    CharacterOwner->AddMovementInput(DesiredDir, 1.f);
-    SmoothFaceDirection(DesiredDir, DeltaTime);
+    CharacterOwner->AddMovementInput(FinalDir, 1.f);
+    SmoothFaceDirection(FinalDir, DeltaTime);
 
     return false;
 }
 
 //DebugTools
-void UUnitMovementComponent::DebugTools(const FVector& FinalDir, const FVector& MyPos)
+void UUnitMovementComponent::DebugTools(const FVector& DesiredDir, const FVector& MyPos)
 {
     // Clipping debug (visual only)
     if (CapComp)
@@ -261,7 +266,7 @@ void UUnitMovementComponent::DebugTools(const FVector& FinalDir, const FVector& 
 
         FVector Start = MyPos; Start.Z = Z;
 
-        FVector Dir = FVector(FinalDir.X, FinalDir.Y, 0.f).GetSafeNormal();
+        FVector Dir = FVector(DesiredDir.X, DesiredDir.Y, 0.f).GetSafeNormal();
         if (Dir.IsNearlyZero())
         {
             return;
@@ -275,6 +280,7 @@ void UUnitMovementComponent::DebugTools(const FVector& FinalDir, const FVector& 
 
 bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& MyPos, float DeltaTime)
 {
+    bUnitInRangeForSoft = false;
     bool bGoalAdjusted = false;
     if (!CharacterOwner || !GetWorld()) return false;
 
@@ -420,6 +426,14 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
             const FVector OtherLoc = Other->GetActorLocation();
             const FVector Other2D(OtherLoc.X, OtherLoc.Y, 0.f);
 
+            //checking if soft collision should run this tick
+            const float GateRange = CombinedRadius + SoftGateBuffer;
+            const float DistSq2D = FVector::DistSquared2D(MyPos2D, Other2D);
+            if (DistSq2D <= FMath::Square(GateRange))
+            {
+                bUnitInRangeForSoft = true;
+            }
+
             // Goal-block check (separate from corridor)
             if (bIsFinalPoint)
             {
@@ -558,127 +572,6 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
 
     return bGoalAdjusted;
 }
-
-// InitialAvoidance v3 
-/*
-void UUnitMovementComponent::InitialAvoidance(FVector& DesiredDir, const FVector& MyPos, float DeltaTime, AActor* DominantBlocker)
-{
-    if (!CharacterOwner || !DominantBlocker) return;
-    if (DeltaTime <= 0.f) return;                                               //Might not need delta time at all, if removed later remove this and the peramitor
-
-    // ---- Tunables (v3) ----
-    // Start earlier + commit harder so the arc "ends higher"
-    const float ReactionTime = 0.50f;          // was 0.40
-    const float StartBuffer = 30.f;            // was 22
-    const float MaxExtraStart = 280.f;         // was 220
-
-    // Stronger + more committed arc
-    const float TurnRate = 18.f;              // was 14
-    const float MinTangentW = 0.75f;           // was 0.55
-    const float MaxTangentW = 2.35f;           // was 1.85
-
-    // Bias to "stay on the arc" instead of snapping back toward forward
-    const float ForwardWeight = 0.70f;         // was effectively 1.0 in v2
-    const float TangentBoost = 1.20f;          // extra overall tangent emphasis
-
-    // Repulsion near contact (kept modest)
-    const float MaxAwayW = 0.70f;
-
-    // Size scaling
-    const float SizeScaleMin = 0.85f;
-    const float SizeScaleMax = 1.45f;
-    const float SizeRefRadius = 45.f;
-
-    // ---- 2D ----
-    FVector DesiredDir2D(DesiredDir.X, DesiredDir.Y, 0.f);
-    if (DesiredDir2D.IsNearlyZero()) return;
-    DesiredDir2D.Normalize();
-
-    const FVector OtherLoc = DominantBlocker->GetActorLocation();
-    FVector ToOther2D(OtherLoc.X - MyPos.X, OtherLoc.Y - MyPos.Y, 0.f);
-
-    const float DistToOther = ToOther2D.Size();
-    if (DistToOther < KINDA_SMALL_NUMBER)
-    {
-        DesiredDir = -DesiredDir2D;
-        return;
-    }
-
-    const FVector ToOtherN = ToOther2D / DistToOther;
-
-    const float OtherRadius = SetOtherRadius(DominantBlocker);
-    const float CombinedRadius = UnitRadius + OtherRadius + ExtraBuffer;
-
-    // Relative approach speed
-    const FVector MyVel2D(CharacterOwner->GetVelocity().X, CharacterOwner->GetVelocity().Y, 0.f);
-    const FVector OtherVel2D(DominantBlocker->GetVelocity().X, DominantBlocker->GetVelocity().Y, 0.f);
-    const FVector RelVel2D = MyVel2D - OtherVel2D;
-
-    const float ApproachSpeed = FMath::Max(0.f, FVector::DotProduct(RelVel2D, ToOtherN));
-
-    // Size scale
-    const float SizeRatio = OtherRadius / FMath::Max(SizeRefRadius, 1.f);
-    const float SizeScale = FMath::Clamp(SizeRatio, SizeScaleMin, SizeScaleMax);
-
-    // Start distance
-    float ExtraStart = ApproachSpeed * ReactionTime;
-    ExtraStart = FMath::Clamp(ExtraStart, 0.f, MaxExtraStart);
-
-    const float TriggerDist = CombinedRadius + (StartBuffer * SizeScale) + (ExtraStart * SizeScale);
-
-    if (DistToOther > TriggerDist)
-    {
-        return;
-    }
-
-    // Strength 0..1
-    float Strength = 1.f - ((DistToOther - CombinedRadius) / FMath::Max(TriggerDist - CombinedRadius, 1.f));
-    Strength = FMath::Clamp(Strength, 0.f, 1.f);
-
-    // v3: ramp up even earlier so the arc commits sooner and carries farther
-    Strength = FMath::Pow(Strength, 0.40f); // was 0.55 in v2
-
-    // Tangent around blocker
-    const FVector TangentA = FVector::CrossProduct(FVector::UpVector, ToOtherN).GetSafeNormal();
-    const FVector TangentB = -TangentA;
-
-    const float DotA = FVector::DotProduct(TangentA, DesiredDir2D);
-    const float DotB = FVector::DotProduct(TangentB, DesiredDir2D);
-
-    FVector Tangent = (DotA >= DotB) ? TangentA : TangentB;
-
-    // Ensure tangent still preserves forward intent (avoid picking a tangent that points backwards if Desired2D is odd)
-    if (FVector::DotProduct(Tangent, DesiredDir2D) < 0.f)
-    {
-        Tangent = -Tangent;
-    }
-
-    const FVector Away = (-ToOtherN);
-
-    // v3: heavier tangent emphasis
-    const float TangentW = FMath::Lerp(MinTangentW, MaxTangentW, Strength) * SizeScale * TangentBoost;
-
-    // v3: away only near contact
-    const float AwayW = MaxAwayW * FMath::Pow(Strength, 1.8f);
-
-    // v3: reduce forward weight as we get very close so we keep "swinging wide"
-    const float ForwardW = FMath::Lerp(ForwardWeight, 1.0f, 1.f - Strength);
-
-    FVector Steer = (DesiredDir2D * ForwardW) + (Tangent * TangentW) + (Away * AwayW);
-    if (!Steer.Normalize()) return;
-
-    // Faster blend, size-scaled, and more aggressive near contact
-    const float Alpha = FMath::Clamp(TurnRate * SizeScale * Strength * DeltaTime, 0.f, 1.f);
-
-    FVector NewDesired = FMath::Lerp(DesiredDir2D, Steer, Alpha);
-    NewDesired.Z = 0.f;
-    NewDesired.Normalize();
-
-    DesiredDir.X = NewDesired.X;
-    DesiredDir.Y = NewDesired.Y;
-    DesiredDir.Z = 0.f;
-}
-*/
 
 // New InitialAvoidance Version 4
 void UUnitMovementComponent::InitialAvoidance(FVector& DesiredDir, const FVector& MyPos, AActor* DominantBlocker)
@@ -832,199 +725,107 @@ void UUnitMovementComponent::InitialAvoidance(FVector& DesiredDir, const FVector
     DesiredDir.Z = 0.f;
 }
 
-//New Soft Collision V2
-bool UUnitMovementComponent::SoftCollision(FVector& DesiredDir, const FVector& MyPos, float DeltaTime)
+//New SoftCollision V6
+bool UUnitMovementComponent::SoftCollision(const FVector& DesiredDir, const FVector& MyPos, float DeltaTime, FVector& OutMoveDir2D)
 {
-    bool bSoftCollisionEngaged = false;
+    OutMoveDir2D = FVector::ZeroVector;
 
-    if (!bEnableSoftCollision) return bSoftCollisionEngaged;
-    if (!CharacterOwner || !CapComp || !GetWorld()) return bSoftCollisionEngaged;
+    if (!bEnableSoftCollision || !CharacterOwner || !CapComp)
+        return false;
 
-    FVector PriorDir = DesiredDir;
+    if (!bUnitInRangeForSoft && SteeringAuthority != ESteeringAuthority::SoftCollision)
+        return false;
 
-    // Forward intent (2D)
-    FVector Forward2D(DesiredDir.X, DesiredDir.Y, 0.f);
-    if (Forward2D.IsNearlyZero()) return bSoftCollisionEngaged;
-    Forward2D = Forward2D.GetSafeNormal();
+    FVector Desired2D(DesiredDir.X, DesiredDir.Y, 0.f);
+    if (Desired2D.IsNearlyZero())
+        return false;
 
+    Desired2D.Normalize();
+
+    // --- Sweep forward to find blocker (same as V1-style)
     const FVector CapCenter = CapComp->GetComponentLocation();
-    const float   CapRadius = CapComp->GetScaledCapsuleRadius();
-    const float   CapHalf = CapComp->GetScaledCapsuleHalfHeight();
+    const float CapRadius = CapComp->GetScaledCapsuleRadius();
+    const float CapHalf = CapComp->GetScaledCapsuleHalfHeight();
 
-    const float BasePre = FMath::Clamp(UnitRadius * 0.20f, 6.f, 16.f);
-    const float PreBuffer = BasePre;
-    const float QueryRadius = CapRadius + PreBuffer;
+    const float StepDist = FMath::Max(2.f, MoveSpeed * DeltaTime);
+    const FVector Start = CapCenter;
+    const FVector End = CapCenter + Desired2D * StepDist;
 
-    // Overlap query (same as before)
-    TArray<FOverlapResult> Hits;
-    FCollisionQueryParams Params(SCENE_QUERY_STAT(SoftCollisionOverlap), true, CharacterOwner);
-    FCollisionObjectQueryParams ObjQuery;
-    ObjQuery.AddObjectTypesToQuery(ECC_Pawn);
+    FCollisionQueryParams Params(SCENE_QUERY_STAT(SoftCollision), true, CharacterOwner);
+    Params.AddIgnoredActor(CharacterOwner);
 
-    const bool bAny = GetWorld()->OverlapMultiByObjectType(
-        Hits,
-        CapCenter,
-        FQuat::Identity,
-        ObjQuery,
-        FCollisionShape::MakeCapsule(QueryRadius, CapHalf),
-        Params
-    );
+    FCollisionObjectQueryParams ObjParams;
+    ObjParams.AddObjectTypesToQuery(ECC_Pawn);
+    ObjParams.AddObjectTypesToQuery(ECC_PhysicsBody);
 
-    if (!bAny || Hits.Num() == 0) return bSoftCollisionEngaged;
+    FHitResult Hit;
+    const bool bHit = GetWorld()->SweepSingleByObjectType(
+        Hit,
+        Start,
+        End,
+        CapComp->GetComponentQuat(),
+        ObjParams,
+        FCollisionShape::MakeCapsule(CapRadius, CapHalf),
+        Params);
 
-    // Spacing buffer (log10)
-    const float SafeRadius = FMath::Max(UnitRadius, 1.f);
-    const float Buffer = ExtraBuffer + (5.f * FMath::LogX(10.f, SafeRadius));
+    AActor* Other = bHit ? Hit.GetActor() : nullptr;
 
-    FVector SepSum2D = FVector::ZeroVector;
-    float TotalW = 0.f;
-
-    bool bAnyTrueOverlap = false;
-    float MaxOverlapT = 0.f;
-    float MaxPreT = 0.f;
-
-    FVector StrongestAway2D = FVector::ZeroVector;
-    float StrongestPen = 0.f;
-
-    for (const FOverlapResult& H : Hits)
+    if (!Other) //if we didnt hit something
     {
-        AActor* Other = H.GetActor();
-        if (!Other || Other == CharacterOwner) continue;
-        if (MoveTargetActor.IsValid() && Other == MoveTargetActor.Get()) continue;
+        if (SteeringAuthority != ESteeringAuthority::SoftCollision)
+            return false;
 
-        const float OtherRadius = SetOtherRadius(Other);
-        const float DesiredSep = UnitRadius + OtherRadius + Buffer;
-        const float ReactDist = DesiredSep + PreBuffer;
+        // overlap-sticky at CapCenter (slightly inflated)
+        TArray<FOverlapResult> Overlaps;
+        const float Inflate = 6.f;
+        const float R = CapRadius + Inflate;
 
-        const FVector OtherPos = Other->GetActorLocation();
+        FCollisionQueryParams QParams(SCENE_QUERY_STAT(SoftCollisionSticky), true, CharacterOwner);
+        QParams.AddIgnoredActor(CharacterOwner);
 
-        // Vector from me -> other (2D), used to gate "behind me" behavior
-        const FVector ToOther2D(OtherPos.X - CapCenter.X, OtherPos.Y - CapCenter.Y, 0.f);
-        const float ForwardProj = FVector::DotProduct(ToOther2D, Forward2D); // +in front, -behind
+        const bool bAny = GetWorld()->OverlapMultiByObjectType(
+            Overlaps, CapCenter, FQuat::Identity,
+            ObjParams,
+            FCollisionShape::MakeCapsule(R, CapHalf),
+            QParams
+        );
+        if (!bAny) return false;
 
-        FVector Delta2D(CapCenter.X - OtherPos.X, CapCenter.Y - OtherPos.Y, 0.f);
-        float Dist2D = Delta2D.Size();
-
-        if (Dist2D < KINDA_SMALL_NUMBER)
+        for (const FOverlapResult& O : Overlaps)
         {
-            Delta2D = FVector(0.f, (float)AvoidanceSide, 0.f);
-            Dist2D = 1.f;
+            AActor* A = O.GetActor();
+            if (!A) continue;
+            if (MoveTargetActor.IsValid() && A == MoveTargetActor.Get()) continue;
+            Other = A;
+            break;
         }
-
-        if (Dist2D >= ReactDist) continue;
-
-        const FVector AwayDir = (Delta2D / Dist2D);
-
-        // ---- KEY CHANGE:
-        // Only allow PREBUFFER steering for things IN FRONT.
-        // Still allow TRUE OVERLAP handling even if slightly behind (prevents clipping).
-        const bool bTrueOverlap = (Dist2D < DesiredSep);
-        if (!bTrueOverlap)
-        {
-            // If it's not overlapping and it's not in front, ignore it (prevents post-pass orbit/overcorrect)
-            if (ForwardProj <= 0.f)
-                continue;
-        }
-
-        float W = 0.f;
-
-        if (bTrueOverlap)
-        {
-            bAnyTrueOverlap = true;
-
-            const float Pen = (DesiredSep - Dist2D);
-            if (Pen > StrongestPen)
-            {
-                StrongestPen = Pen;
-                StrongestAway2D = AwayDir;
-            }
-
-            float t = Pen / FMath::Max(DesiredSep, 1.f);
-            t = FMath::Clamp(t, 0.f, 1.f);
-            MaxOverlapT = FMath::Max(MaxOverlapT, t);
-
-            W = FMath::Pow(t, 1.35f) * 4.6f;
-        }
-        else
-        {
-            float t = (ReactDist - Dist2D) / FMath::Max(PreBuffer, 1.f);
-            t = FMath::Clamp(t, 0.f, 1.f);
-            MaxPreT = FMath::Max(MaxPreT, t);
-
-            W = FMath::Pow(t, 1.0f) * 0.9f;
-        }
-
-        SepSum2D += AwayDir * W;
-        TotalW += W;
+        if (!Other) return false;
     }
 
-    if (TotalW <= KINDA_SMALL_NUMBER || SepSum2D.IsNearlyZero()) return bSoftCollisionEngaged;
+    if (!Other || (MoveTargetActor.IsValid() && Other == MoveTargetActor.Get()))
+        return false;
 
-    FVector SepDir2D = (SepSum2D / TotalW).GetSafeNormal();
+    FVector ToOther2D = FVector(
+        Other->GetActorLocation().X - CapCenter.X,
+        Other->GetActorLocation().Y - CapCenter.Y,
+        0.f);
 
-    // Never push backwards
-    const float BackDot = FVector::DotProduct(SepDir2D, Forward2D);
-    if (BackDot < 0.f)
-    {
-        SepDir2D -= Forward2D * BackDot;
-        if (SepDir2D.IsNearlyZero()) return bSoftCollisionEngaged;
-        SepDir2D = SepDir2D.GetSafeNormal();
-    }
+    if (ToOther2D.IsNearlyZero())
+        return false;
 
-    // Micro depenetration (unchanged)
-    if (bAnyTrueOverlap && StrongestPen > 0.f && !StrongestAway2D.IsNearlyZero())
-    {
-        const float PenTolerance = FMath::Max(1.5f, UnitRadius * 0.03f);
-        const float ExcessPen = StrongestPen - PenTolerance;
+    ToOther2D.Normalize();
 
-        if (ExcessPen > 0.f)
-        {
-            const float PushFrac = 0.45f;
-            const float MaxPush = FMath::Max(1.5f, UnitRadius * 0.14f);
+    // If we are NOT steering into the unit anymore → RELEASE
+    if (FVector::DotProduct(Desired2D, ToOther2D) <= 0.f)
+        return false;
 
-            const float PushDist = FMath::Min(ExcessPen * PushFrac, MaxPush);
-            const FVector PushDelta = FVector(StrongestAway2D.X, StrongestAway2D.Y, 0.f) * PushDist;
+    // --- Stable slide direction (no Hit.Normal)
+    FVector Slide2D = FVector(-ToOther2D.Y, ToOther2D.X, 0.f) * (float)AvoidanceSide;
+    Slide2D.Normalize();
 
-            FHitResult Hit;
-            CapComp->MoveComponent(PushDelta, CapComp->GetComponentQuat(), true, &Hit);
-        }
-    }
+    OutMoveDir2D = Slide2D;
 
-    // Steering blend (unchanged)
-    float Blend = SoftCollisionBlend;
-
-    if (bAnyTrueOverlap)
-    {
-        Blend = FMath::Max(Blend, 0.86f);
-        Blend += MaxOverlapT * 0.06f;
-    }
-    else
-    {
-        Blend += MaxPreT * 0.20f;
-        Blend = FMath::Clamp(Blend, 0.f, 0.65f);
-    }
-
-    Blend = FMath::Clamp(Blend, 0.f, 0.95f);
-
-    FVector NewDir2D = (Forward2D * (1.f - Blend)) + (SepDir2D * Blend);
-    if (NewDir2D.IsNearlyZero()) return bSoftCollisionEngaged;
-    NewDir2D = NewDir2D.GetSafeNormal();
-
-    if (FVector::DotProduct(NewDir2D, Forward2D) <= 0.f)
-    {
-        NewDir2D = (SepDir2D + Forward2D * 0.10f).GetSafeNormal();
-        if (NewDir2D.IsNearlyZero()) return bSoftCollisionEngaged;
-    }
-
-    bSoftCollisionEngaged = true;
-    DesiredDir = FVector(NewDir2D.X, NewDir2D.Y, 0.f);
-
-    if (DesiredDir.IsNearlyZero())
-    {
-        bSoftCollisionEngaged = false;
-        DesiredDir = PriorDir;
-    }
-    return bSoftCollisionEngaged;
+    return true;
 }
 
 //GoalAdjustment
@@ -1113,17 +914,12 @@ bool UUnitMovementComponent::ClippingFix(const FVector& MyPos)
                 return ComputeSafestPoint(ClippingHits);
             }
         }
-    }    
+    }
     return false;
 }
 
 bool UUnitMovementComponent::ComputeSafestPoint(TArray<FOverlapResult>& NearObjects)
 {
-    if (GEngine)
-    {
-        GEngine->AddOnScreenDebugMessage(123, 3.0f, FColor::Orange, TEXT("ComputeSafestPoint"));
-    }
-
     if (InternalPathPoints.Num() == 0)
         return false;
 

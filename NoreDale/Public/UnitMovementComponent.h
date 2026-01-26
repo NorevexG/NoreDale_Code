@@ -63,6 +63,10 @@ public:
 
     // Soft Collision
     UPROPERTY(EditAnywhere, Category = "Soft Collision")
+    float SoftGateBuffer = 40.f;
+    UPROPERTY(EditAnywhere, Category = "Soft Collision")
+    bool bUnitInRangeForSoft = false;
+    UPROPERTY(EditAnywhere, Category = "Soft Collision")
     bool bEnableSoftCollision = true;
 
     UPROPERTY(EditAnywhere, Category = "Soft Collision", meta = (ClampMin = "0.0", ClampMax = "1.0"))
@@ -120,13 +124,6 @@ protected:
     //temp for version 5-9 apply avoidance
     FVector PrevAvoidDir2D = FVector::ZeroVector;
 
-    //used in SoftCollision V7
-    bool bSoftCol_WasOverlapping = false;
-    float SoftCol_EntryBoostTimer = 0.f;
-    //Temp Soft Collision V11
-    float Soft_HoldRemaining = 0.f;
-    FVector Soft_LastSepDir2D = FVector::ZeroVector;
-    float Soft_LastSepWeight = 0.f;
 
     //temp AvoidanceCheck v6
     float Avoid_InitialLockRemaining = 0.f;
@@ -165,7 +162,7 @@ protected:
     //EmergancyAvoidance
 
     //SoftCollision
-    bool SoftCollision(FVector& DesiredDir, const FVector& MyPos, float DeltaTime);
+    bool SoftCollision(const FVector& ForwardDir, const FVector& MyPos, float DeltaTime, FVector& OutMoveDir2D);
 
     //GoalAdjustments
     bool GoalAdjustment();
