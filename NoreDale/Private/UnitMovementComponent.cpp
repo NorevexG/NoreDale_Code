@@ -12,6 +12,7 @@
 #include "DrawDebugHelpers.h"
 #include "Components/CapsuleComponent.h"
 #include "Engine/World.h"
+#include "Engine/Engine.h"
 #include "Engine/EngineTypes.h"
 
 UUnitMovementComponent::UUnitMovementComponent()
@@ -203,6 +204,7 @@ bool UUnitMovementComponent::TickMoveAlongPath(float DeltaTime)
     else
     {
         SteeringAuthority = ESteeringAuthority::PathFollowing;
+        SoftCollisionActor = nullptr;
     }
 
     DebugTools(FinalDir, Pos);
@@ -281,59 +283,38 @@ void UUnitMovementComponent::DebugTools(const FVector& DesiredDir, const FVector
 bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& MyPos, float DeltaTime)
 {
     bUnitInRangeForSoft = false;
+
+    if (!CharacterOwner || !GetWorld())
+    {
+        ForwardColor = FColor::Green;
+        return false;
+    }
+
     bool bGoalAdjusted = false;
-    if (!CharacterOwner || !GetWorld()) return false;
 
     const float Range = FMath::Max(50.f, AvoidanceCheckDistance);
 
-    const float InitialLockTime = 0.28f;
-    const float ReplaceLockIfMuchCloserFactor = 0.65f;
-    const float CriticalEdgeToBreakLock = 2.f;
-
-    const float RecentBlockHoldTime = 0.18f;
-
     const FVector MyPos2D(MyPos.X, MyPos.Y, 0.f);
-
     const bool bHasPath = InternalPathPoints.Num() > 0;
     const bool bIsFinalPoint = bHasPath && (CurrentPathIndex >= InternalPathPoints.Num() - 1);
 
-    FVector PointA3D = CurrentGoal;
+    FVector Goal3D = CurrentGoal;
     if (InternalPathPoints.IsValidIndex(CurrentPathIndex))
     {
-        PointA3D = InternalPathPoints[CurrentPathIndex];
+        Goal3D = InternalPathPoints[CurrentPathIndex];
     }
-    const FVector PointA2D(PointA3D.X, PointA3D.Y, 0.f);
 
-    FVector DirA2D = PointA2D - MyPos2D;
-    const float DistToA = DirA2D.Size();
-    if (DistToA < KINDA_SMALL_NUMBER) return false;
-    DirA2D /= DistToA;
+    const FVector Goal2D(Goal3D.X, Goal3D.Y, 0.f);
+    const FVector ToGoalVec = (Goal2D - MyPos2D);
+    const float DistToGoal = ToGoalVec.Size();
 
-    const float LenA = bIsFinalPoint ? DistToA : FMath::Min(Range, DistToA);
-    const FVector StartA = MyPos2D;
-    const FVector EndA = MyPos2D + DirA2D * LenA;
-
-    const float Remaining = Range - FMath::Min(Range, LenA);
-
-    float LenB = 0.f;
-    FVector StartB = PointA2D;
-    FVector EndB = PointA2D;
-
-    if (Remaining > KINDA_SMALL_NUMBER && InternalPathPoints.IsValidIndex(CurrentPathIndex + 1))
+    if (DistToGoal < KINDA_SMALL_NUMBER)
     {
-        const FVector PointB3D = InternalPathPoints[CurrentPathIndex + 1];
-        const FVector PointB2D(PointB3D.X, PointB3D.Y, 0.f);
-
-        const FVector AB = (PointB2D - PointA2D);
-        const float DistAB = AB.Size();
-        if (DistAB > KINDA_SMALL_NUMBER)
-        {
-            const FVector DirB2D = AB / DistAB;
-            LenB = FMath::Min(Remaining, DistAB);
-            StartB = PointA2D;
-            EndB = PointA2D + DirB2D * LenB;
-        }
+        ForwardColor = FColor::Green;
+        return false;
     }
+
+    const FVector DirToGoal2D = ToGoalVec / DistToGoal;
 
     TArray<FOverlapResult> Overlaps;
     FCollisionObjectQueryParams ObjQuery;
@@ -342,7 +323,7 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
 
     FCollisionQueryParams Params(SCENE_QUERY_STAT(AvoidanceOverlap), true, CharacterOwner);
 
-    const bool bAny = GetWorld()->OverlapMultiByObjectType(
+    GetWorld()->OverlapMultiByObjectType(
         Overlaps,
         MyPos,
         FQuat::Identity,
@@ -352,377 +333,75 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
     );
 
     bool bDetectedAny = false;
-    bool bInCorridor = false;
     bool bGoalBlocked = false;
 
-    TArray<AActor*> BlockingActors;
-    AActor* DominantBlocker = nullptr;
-
-    float BestDomScore = -FLT_MAX;
-    float BestDomDist2D = FLT_MAX;
-    float BestDomCombinedRadius = 0.f;
-
-    auto ClosestPointOnSegment2D = [&](const FVector& P, const FVector& S, const FVector& E, float& OutAlong, FVector& OutClosest)
+    for (const FOverlapResult& Res : Overlaps)
     {
-        const FVector SE = (E - S);
-        const float SegLen = SE.Size();
-        if (SegLen < KINDA_SMALL_NUMBER)
+        AActor* Other = Res.GetActor();
+        if (!Other || Other == CharacterOwner)
         {
-            OutAlong = 0.f;
-            OutClosest = S;
-            return;
+            continue;
         }
 
-        const FVector Dir = SE / SegLen;
-        float t = FVector::DotProduct((P - S), Dir);
-        t = FMath::Clamp(t, 0.f, SegLen);
-        OutAlong = t;
-        OutClosest = S + Dir * t;
-    };
-
-    auto TestSegment = [&](AActor* Other, const FVector& SegStart, const FVector& SegEnd, float SegLen, float CombinedRadius,
-        bool& bOutInFront, float& OutAlong, float& OutPerp) -> bool
-    {
-        bOutInFront = false;
-        OutAlong = 0.f;
-        OutPerp = FLT_MAX;
-
-        if (!Other || SegLen < KINDA_SMALL_NUMBER) return false;
+        bDetectedAny = true;
 
         const FVector OtherLoc = Other->GetActorLocation();
         const FVector Other2D(OtherLoc.X, OtherLoc.Y, 0.f);
 
-        FVector Closest = SegStart;
-        ClosestPointOnSegment2D(Other2D, SegStart, SegEnd, OutAlong, Closest);
+        const float OtherR = SetOtherRadius(Other);
+        const float CombinedR = UnitRadius + OtherR + ExtraBuffer;
 
-        const FVector SegDir = (SegEnd - SegStart).GetSafeNormal();
-        const float RawAlong = FVector::DotProduct((Other2D - SegStart), SegDir);
-        if (RawAlong > 0.f && RawAlong <= SegLen + 1.f) bOutInFront = true;
+        const float Dist2D = FVector::Dist2D(MyPos, OtherLoc);
 
-        OutPerp = FVector::Dist(Other2D, Closest);
-        return (bOutInFront && OutPerp <= CombinedRadius);
-    };
-
-    auto ScoreDominant = [&](float Along, float Perp, float CombinedRadius) -> float
-    {
-        const float AlongN = 1.f - FMath::Clamp(Along / FMath::Max(Range, 1.f), 0.f, 1.f);
-        const float PerpN = 1.f - FMath::Clamp(Perp / FMath::Max(CombinedRadius, 1.f), 0.f, 1.f);
-        return AlongN * 2.0f + PerpN * 1.0f;
-    };
-
-    if (bAny && Overlaps.Num() > 0)
-    {
-        for (const FOverlapResult& R : Overlaps)
+        const float SoftEnter = UnitRadius + OtherR + SoftGateBuffer;
+        if (Dist2D <= SoftEnter)
         {
-            AActor* Other = R.GetActor();
-            if (!Other || Other == CharacterOwner) continue;
-            if (MoveTargetActor.IsValid() && Other == MoveTargetActor.Get()) continue;
+            bUnitInRangeForSoft = true;
+        }
+        if (bIsFinalPoint)
+        {
+            const FVector ToOther = (Other2D - MyPos2D);
+            const float Along = FVector::DotProduct(ToOther, DirToGoal2D);
+            const float ClampedAlong = FMath::Clamp(Along, 0.f, DistToGoal);
+            const FVector Closest = MyPos2D + DirToGoal2D * ClampedAlong;
 
-            bDetectedAny = true;
-
-            const float OtherRadius = SetOtherRadius(Other);
-            const float CombinedRadius = UnitRadius + OtherRadius + ExtraBuffer;
-
-            const FVector OtherLoc = Other->GetActorLocation();
-            const FVector Other2D(OtherLoc.X, OtherLoc.Y, 0.f);
-
-            //checking if soft collision should run this tick
-            const float GateRange = CombinedRadius + SoftGateBuffer;
-            const float DistSq2D = FVector::DistSquared2D(MyPos2D, Other2D);
-            if (DistSq2D <= FMath::Square(GateRange))
+            const float Perp = (Other2D - Closest).Size();
+            if (Perp <= CombinedR && Along >= -CombinedR && Along <= (DistToGoal + CombinedR))
             {
-                bUnitInRangeForSoft = true;
-            }
-
-            // Goal-block check (separate from corridor)
-            if (bIsFinalPoint)
-            {
-                const float GoalDist = FVector::Dist(Other2D, PointA2D);
-                if (GoalDist <= CombinedRadius)
-                {
-                    bGoalBlocked = true;
-                    BlockingActors.AddUnique(Other);
-                }
-            }
-
-            bool bInFrontA = false, bInFrontB = false;
-            float AlongA = 0.f, PerpA = FLT_MAX;
-            float AlongB = 0.f, PerpB = FLT_MAX;
-
-            const bool bBlockA = TestSegment(Other, StartA, EndA, LenA, CombinedRadius, bInFrontA, AlongA, PerpA);
-            const bool bBlockB = (LenB > 0.f) ? TestSegment(Other, StartB, EndB, LenB, CombinedRadius, bInFrontB, AlongB, PerpB) : false;
-
-            if (bBlockA || bBlockB)
-            {
-                bInCorridor = true;
-                BlockingActors.AddUnique(Other);
-
-                const float UseAlong = bBlockA ? AlongA : AlongB;
-                const float UsePerp = bBlockA ? PerpA : PerpB;
-
-                const float Score = ScoreDominant(UseAlong, UsePerp, CombinedRadius);
-                const float Dist2D = FVector::Dist2D(MyPos, OtherLoc);
-
-                if (Score > BestDomScore || (FMath::IsNearlyEqual(Score, BestDomScore, 0.01f) && Dist2D < BestDomDist2D))
-                {
-                    BestDomScore = Score;
-                    BestDomDist2D = Dist2D;
-                    BestDomCombinedRadius = CombinedRadius;
-                    DominantBlocker = Other;
-                }
+                bGoalBlocked = true;
             }
         }
     }
-
-    // GoalAdjustment should be driven by goal-block, not corridor-block
     if (bGoalBlocked && bIsFinalPoint)
     {
         bGoalAdjusted = GoalAdjustment();
         if (bGoalAdjusted)
         {
+            ForwardColor = bDetectedAny ? FColor::Blue : FColor::Green;
             return true;
         }
     }
 
-    // Recent-block hold: refresh if corridor-block OR goal-block
-    if (bInCorridor || bGoalBlocked)
+    // -=-=-=-=-=-=- EmergancyAvoidance -=-=-=-=-=-=-
+    const bool bEmergencyNeeded = false;
+    // -=-=-=-=-=-=- EmergancyAvoidance -=-=-=-=-=-=-
+
+    // -=-=-=-=-=-=-=-=-=- Debug -=-=-=-=-=-=-=-=-=-
+    if (bEmergencyNeeded)
     {
-        Avoid_RecentBlockRemaining = RecentBlockHoldTime;
+        ForwardColor = FColor::Red;
+    }
+    else if (bDetectedAny)
+    {
+        ForwardColor = FColor::Blue;
     }
     else
     {
-        Avoid_RecentBlockRemaining = FMath::Max(0.f, Avoid_RecentBlockRemaining - DeltaTime);
+        ForwardColor = FColor::Green;
     }
-    const bool bRecentlyBlocked = (Avoid_RecentBlockRemaining > 0.f);
-
-    const bool bInitialAvoid = (bInCorridor || bGoalBlocked || bRecentlyBlocked);
-
-    // Safety lock
-    Avoid_InitialLockRemaining = FMath::Max(0.f, Avoid_InitialLockRemaining - DeltaTime);
-
-    const bool bHasLock = (Avoid_InitialLockRemaining > 0.f) && Avoid_LockedDominant.IsValid();
-    AActor* LockedActor = bHasLock ? Avoid_LockedDominant.Get() : nullptr;
-
-    if ((SteeringAuthority == ESteeringAuthority::SoftCollision) && LockedActor && DominantBlocker && (DominantBlocker != LockedActor))
-    {
-        SteeringAuthority = ESteeringAuthority::PathFollowing;
-    }
-
-    auto AcquireLock = [&]()
-    {
-        Avoid_LockedDominant = DominantBlocker;
-        Avoid_InitialLockRemaining = InitialLockTime;
-        LockedActor = DominantBlocker;
-    };
-
-    if (bInitialAvoid)
-    {
-        if (!bHasLock)
-        {
-            AcquireLock();
-        }
-        else
-        {
-            bool bBreakLock = false;
-
-            if (!LockedActor) bBreakLock = true;
-
-            if (!bBreakLock && DominantBlocker)
-            {
-                const float DominantDist2D = FVector::Dist2D(MyPos, DominantBlocker->GetActorLocation());
-                const float DominantEdge2D = DominantDist2D - BestDomCombinedRadius;
-                if (DominantEdge2D <= CriticalEdgeToBreakLock) bBreakLock = true;
-            }
-
-            if (!bBreakLock && DominantBlocker && LockedActor && DominantBlocker != LockedActor)
-            {
-                const float LockedDist = FVector::Dist2D(MyPos, LockedActor->GetActorLocation());
-                const float NewDist = FVector::Dist2D(MyPos, DominantBlocker->GetActorLocation());
-                if (NewDist <= LockedDist * ReplaceLockIfMuchCloserFactor) bBreakLock = true;
-            }
-
-            if (bBreakLock)
-            {
-                AcquireLock();
-            }
-        }
-    }
-    else
-    {
-        Avoid_LockedDominant = nullptr;
-        Avoid_InitialLockRemaining = 0.f;
-        LockedActor = nullptr;
-    }
-
-    if (SteeringAuthority != ESteeringAuthority::SoftCollision)
-    {
-        AActor* EffectiveDominant = LockedActor ? LockedActor : DominantBlocker;
-
-        if (bInitialAvoid && EffectiveDominant)
-        {
-            //InitialAvoidance(DesiredDir, MyPos, EffectiveDominant);
-        }
-    }
-
-    //------------------Debug------------------
-    if (bInitialAvoid) ForwardColor = FColor(255, 165, 0);
-    else if (bDetectedAny) ForwardColor = FColor::Blue;
-    else ForwardColor = FColor::Green;
-    //------------------Debug------------------
+    // -=-=-=-=-=-=-=-=-=- Debug -=-=-=-=-=-=-=-=-=-
 
     return bGoalAdjusted;
-}
-
-// New InitialAvoidance Version 4
-void UUnitMovementComponent::InitialAvoidance(FVector& DesiredDir, const FVector& MyPos, AActor* DominantBlocker)
-{
-    if (!CharacterOwner || !DominantBlocker) return;
-
-    const float DeltaTime = GetWorld() ? GetWorld()->GetDeltaSeconds() : 0.f;
-    if (DeltaTime <= 0.f) return;
-
-    FVector PathDir2D(DesiredDir.X, DesiredDir.Y, 0.f);
-    if (PathDir2D.IsNearlyZero()) return;
-    PathDir2D.Normalize();
-
-    const FVector MyPos2D(MyPos.X, MyPos.Y, 0.f);
-    const FVector OtherLoc = DominantBlocker->GetActorLocation();
-    const FVector OtherPos2D(OtherLoc.X, OtherLoc.Y, 0.f);
-
-    FVector ToOther2D = OtherPos2D - MyPos2D;
-    const float Dist = ToOther2D.Size();
-    if (Dist < KINDA_SMALL_NUMBER) return;
-
-    const FVector ToOtherN = ToOther2D / Dist;
-
-    const float OtherRadius = SetOtherRadius(DominantBlocker);
-    const float CombinedRadius = UnitRadius + OtherRadius + ExtraBuffer;
-
-    // Window timing (same feel as v2/v3)
-    const float ReactionTime = 0.35f;
-    const float StartBuffer = 20.f;
-    const float MaxExtraStart = 180.f;
-
-    const FVector MyVel2D(CharacterOwner->GetVelocity().X, CharacterOwner->GetVelocity().Y, 0.f);
-    const FVector OtherVel2D(DominantBlocker->GetVelocity().X, DominantBlocker->GetVelocity().Y, 0.f);
-    const FVector RelVel2D = MyVel2D - OtherVel2D;
-
-    const float ApproachSpeed = FMath::Max(0.f, FVector::DotProduct(RelVel2D, ToOtherN));
-    const float ExtraStart = FMath::Clamp(ApproachSpeed * ReactionTime, 0.f, MaxExtraStart);
-
-    const float TriggerDist = CombinedRadius + StartBuffer + ExtraStart;
-
-    // Hysteresis + smooth release (prevents snap/thrash)
-    const float ReleaseDistPad = 28.f;
-    const float ReleaseAheadOn = 0.06f;   // must be at least this “ahead” to keep engaging
-    const float ReleaseAheadOff = -0.08f;  // must be behind by this to force release
-    const float ReleaseBlendTime = 0.10f;  // seconds to blend back to path after release
-
-    // If outside band entirely: hard clear
-    if (Dist > TriggerDist + ReleaseDistPad)
-    {
-        IA_Target = nullptr;
-        IA_SideSign = 0;
-        IA_MinDist = BIG_NUMBER;
-        IA_BaseDir2D = FVector::ZeroVector;
-        IA_ReleaseAlpha = 1.f;
-        IA_bReleasing = false;
-        return;
-    }
-
-    // Start / maintain engagement state
-    const bool bNewTarget = (!IA_Target.IsValid() || IA_Target.Get() != DominantBlocker);
-
-    if (bNewTarget)
-    {
-        IA_Target = DominantBlocker;
-        IA_SideSign = 0;
-        IA_MinDist = Dist;
-        IA_BaseDir2D = PathDir2D;   // lock base direction for the engagement
-        IA_bReleasing = false;
-        IA_ReleaseAlpha = 1.f;
-    }
-
-    // Decide whether we should be releasing (shoulder-to-shoulder / passed)
-    const FVector BaseDir2D = IA_BaseDir2D.IsNearlyZero() ? PathDir2D : IA_BaseDir2D;
-    const float Ahead = FVector::DotProduct(ToOtherN, BaseDir2D);
-
-    // If already releasing, keep blending out
-    if (IA_bReleasing)
-    {
-        IA_ReleaseAlpha = FMath::Min(1.f, IA_ReleaseAlpha + (DeltaTime / FMath::Max(ReleaseBlendTime, 0.01f)));
-        const FVector BlendDir = FMath::Lerp(IA_LastAvoidDir2D, PathDir2D, IA_ReleaseAlpha).GetSafeNormal();
-        DesiredDir.X = BlendDir.X;
-        DesiredDir.Y = BlendDir.Y;
-        DesiredDir.Z = 0.f;
-
-        if (IA_ReleaseAlpha >= 1.f)
-        {
-            IA_Target = nullptr;
-            IA_SideSign = 0;
-            IA_MinDist = BIG_NUMBER;
-            IA_BaseDir2D = FVector::ZeroVector;
-            IA_bReleasing = false;
-        }
-        return;
-    }
-
-    // Force release only when clearly behind (hysteresis)
-    if (Ahead <= ReleaseAheadOff)
-    {
-        IA_bReleasing = true;
-        IA_ReleaseAlpha = 0.f;
-        IA_LastAvoidDir2D = FVector(DesiredDir.X, DesiredDir.Y, 0.f).GetSafeNormal();
-        return;
-    }
-
-    // If not sufficiently ahead, do NOT recompute new avoidance; keep current direction (prevents flicker)
-    if (Ahead < ReleaseAheadOn)
-    {
-        return;
-    }
-
-    // Monotonic progress driver
-    IA_MinDist = FMath::Min(IA_MinDist, Dist);
-
-    const float Den = FMath::Max(TriggerDist - CombinedRadius, 1.f);
-    float t = (TriggerDist - IA_MinDist) / Den;
-    t = FMath::Clamp(t, 0.f, 1.f);
-
-    const float Curve = t * t;
-
-    // Lock side once
-    if (IA_SideSign == 0)
-    {
-        const FVector TangentL = FVector::CrossProduct(FVector::UpVector, ToOtherN).GetSafeNormal();
-        const FVector TangentR = -TangentL;
-        IA_SideSign = (FVector::DotProduct(TangentL, BaseDir2D) >= FVector::DotProduct(TangentR, BaseDir2D)) ? +1 : -1;
-    }
-
-    // Slightly wider than v2, but not huge
-    const float SizeRef = 45.f;
-    const float SizeScale = FMath::Clamp(OtherRadius / FMath::Max(SizeRef, 1.f), 0.90f, 1.20f);
-
-    const float MaxArcDegBase = 38.f;
-    const float ExtraArcDegBase = 6.f;
-
-    const float MaxArcDeg = MaxArcDegBase * SizeScale;
-    const float ExtraArcDeg = ExtraArcDegBase * SizeScale;
-
-    const float ExtraRamp = FMath::SmoothStep(0.f, 1.f, FMath::Clamp(t / 0.55f, 0.f, 1.f));
-    const float ArcDeg = (MaxArcDeg * Curve) + (ExtraArcDeg * ExtraRamp);
-
-    FVector NewDir2D = BaseDir2D.RotateAngleAxis(ArcDeg * (float)IA_SideSign, FVector::UpVector);
-    NewDir2D.Z = 0.f;
-    NewDir2D.Normalize();
-
-    IA_LastAvoidDir2D = NewDir2D;
-
-    SteeringAuthority = ESteeringAuthority::InitialAvoidance;
-
-    DesiredDir.X = NewDir2D.X;
-    DesiredDir.Y = NewDir2D.Y;
-    DesiredDir.Z = 0.f;
 }
 
 //New SoftCollision V6
@@ -822,6 +501,8 @@ bool UUnitMovementComponent::SoftCollision(const FVector& DesiredDir, const FVec
     // --- Stable slide direction (no Hit.Normal)
     FVector Slide2D = FVector(-ToOther2D.Y, ToOther2D.X, 0.f) * (float)AvoidanceSide;
     Slide2D.Normalize();
+
+    SoftCollisionActor = Other;
 
     OutMoveDir2D = Slide2D;
 
@@ -924,7 +605,7 @@ bool UUnitMovementComponent::ComputeSafestPoint(TArray<FOverlapResult>& NearObje
         return false;
 
     FVector Desired = InternalPathPoints.Last();
-    float Buffer = ExtraBuffer + (UnitRadius/2);
+    float Buffer = ExtraBuffer + (UnitRadius / 2);
     FVector AccumulatedPush = FVector::ZeroVector;
     float RequiredMoveDist = 0.f;
 

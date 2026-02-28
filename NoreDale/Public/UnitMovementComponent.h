@@ -13,10 +13,9 @@ class UCharacterMovementComponent;
 UENUM(BlueprintType)
 enum class ESteeringAuthority : uint8
 {
-    None            UMETA(DisplayName = "None"),
-    PathFollowing   UMETA(DisplayName = "Path Following"),
-    InitialAvoidance UMETA(DisplayName = "Initial Avoidance"),
-    SoftCollision   UMETA(DisplayName = "Soft Collision")
+    None                UMETA(DisplayName = "None"),
+    PathFollowing       UMETA(DisplayName = "Path Following"),
+    SoftCollision       UMETA(DisplayName = "Soft Collision")
 };
 
 UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent), Blueprintable)
@@ -120,27 +119,8 @@ protected:
     float RotationSizeScale;
 
     FVector CurrentGoal = FVector::ZeroVector;
-
-    //temp for version 5-9 apply avoidance
-    FVector PrevAvoidDir2D = FVector::ZeroVector;
-
-
-    //temp AvoidanceCheck v6
-    float Avoid_InitialLockRemaining = 0.f;
-    TWeakObjectPtr<AActor> Avoid_LockedDominant;
-    float Avoid_RecentBlockRemaining = 0.f;
-
-
-    //Temp New InitialAvoidance V2
-    TWeakObjectPtr<AActor> IA_Target;
-    int32 IA_SideSign = 0;
-    float IA_MinDist = BIG_NUMBER;
-    // v4 additions
-    FVector IA_BaseDir2D = FVector::ZeroVector;  
-    bool IA_bReleasing = false;
-    float IA_ReleaseAlpha = 1.f;
-    FVector IA_LastAvoidDir2D = FVector::ZeroVector;
-
+    //temp for soft collision
+    TWeakObjectPtr<AActor> SoftCollisionActor;
     //Debug Variables
     FColor ForwardColor;
 
@@ -155,11 +135,6 @@ protected:
 
     // Debug-only detection (no steering)
     bool AvoidanceCheck(FVector& DesiredDir, const FVector& MyPos, float DeltaTime);
-
-    //InitialAvoidance
-    void InitialAvoidance(FVector& DesiredDir, const FVector& MyPos, AActor* DominantBlocker);
-
-    //EmergancyAvoidance
 
     //SoftCollision
     bool SoftCollision(const FVector& ForwardDir, const FVector& MyPos, float DeltaTime, FVector& OutMoveDir2D);
