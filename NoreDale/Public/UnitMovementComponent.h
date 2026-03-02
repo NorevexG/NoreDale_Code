@@ -121,6 +121,67 @@ protected:
     FVector CurrentGoal = FVector::ZeroVector;
     //temp for soft collision
     TWeakObjectPtr<AActor> SoftCollisionActor;
+
+    // ---------- Emergency detection (PURE DETECTION ONLY; no steering/execution) ----------
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Emergency|Detect")
+    bool bEnableEmergencyDetection = true;
+
+    // Visual indicator set by detection (ForwardColor will be forced red when true)
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Emergency|Detect")
+    bool bEmergencyDetected = false;
+
+    // Deadlock: relative angle to blocker stays nearly constant for this long.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Emergency|Detect")
+    float Emergency_DeadlockStableSec = 0.25f;
+
+    // Angle delta below this is considered "stable" (radians).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Emergency|Detect")
+    float Emergency_SmallAngleEpsRad = 0.01f;
+
+    // Spin: cumulative signed orbit angle exceeds this (radians). Default = 2*pi.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Emergency|Detect")
+    float Emergency_SpinOrbitRad = 6.28318530718f;
+
+    // Flip-flop: sign toggles within a short time window.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Emergency|Detect")
+    float Emergency_FlipWindowSec = 0.20f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Emergency|Detect")
+    int32 Emergency_FlipToggleThreshold = 4;
+
+    // Progress safety net (used only to validate Spin/Flip; Deadlock bypasses it).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Emergency|Detect")
+    float Emergency_ProgressWindowSec = 0.25f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Emergency|Detect")
+    float Emergency_MinProgressUnits = 5.f;
+
+    // --- internal state (not gameplay execution) ---
+    TWeakObjectPtr<AActor> Emergency_TrackedBlocker;
+    bool Emergency_bHasPrevRelAngle = false;
+    float Emergency_PrevRelAngleRad = 0.f;
+    float Emergency_OrbitSignedRad = 0.f;
+    float Emergency_AngleStableTime = 0.f;
+
+    bool Emergency_bHasPrevPos2D = false;
+    FVector2D Emergency_PrevPos2D = FVector2D::ZeroVector;
+
+    int32 Emergency_PrevSideSign = 0;
+    int32 Emergency_FlipToggleCount = 0;
+    float Emergency_FlipWindowTime = 0.f;
+
+    struct FEmergencyProgressSample
+    {
+        float Dt = 0.f;
+        float Forward = 0.f;
+    };
+    TArray<FEmergencyProgressSample> Emergency_ProgressSamples;
+    float Emergency_ProgressWindowTime = 0.f;
+    float Emergency_ProgressWindowSum = 0.f;
+
+    void ResetEmergencyDetection();
+    void UpdateEmergencyDetection(const FVector& DesiredDir, const FVector& FinalDir, const FVector& MyPos, float DeltaTime, bool bSoftCollisionActive);
+
     //Debug Variables
     FColor ForwardColor;
 

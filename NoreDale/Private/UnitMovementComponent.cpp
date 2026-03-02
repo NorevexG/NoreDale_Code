@@ -207,6 +207,11 @@ bool UUnitMovementComponent::TickMoveAlongPath(float DeltaTime)
         SoftCollisionActor = nullptr;
     }
 
+    UpdateEmergencyDetection(DesiredDir, FinalDir, Pos, DeltaTime, bSoft);
+    if (bEmergencyDetected)
+    {
+        ForwardColor = FColor::Red;
+    }
     DebugTools(FinalDir, Pos);
 
     if (MoveComp)
@@ -387,11 +392,7 @@ bool UUnitMovementComponent::AvoidanceCheck(FVector& DesiredDir, const FVector& 
     // -=-=-=-=-=-=- EmergancyAvoidance -=-=-=-=-=-=-
 
     // -=-=-=-=-=-=-=-=-=- Debug -=-=-=-=-=-=-=-=-=-
-    if (bEmergencyNeeded)
-    {
-        ForwardColor = FColor::Red;
-    }
-    else if (bDetectedAny)
+    if (bDetectedAny)
     {
         ForwardColor = FColor::Blue;
     }
@@ -692,6 +693,169 @@ float UUnitMovementComponent::SetOtherRadius(const AActor* Other)
     }
     return OtherRadius;
 }
+
+
+// ---------- Emergency detection (PURE DETECTION ONLY; no steering/execution) ----------
+static float NormalizeAngleRad(float AngleRad)
+{
+    // Normalize to (-pi, pi]
+    AngleRad = FMath::Fmod(AngleRad, 2.f * PI);
+    if (AngleRad <= -PI) AngleRad += 2.f * PI;
+    if (AngleRad > PI) AngleRad -= 2.f * PI;
+    return AngleRad;
+}
+
+void UUnitMovementComponent::ResetEmergencyDetection()
+{
+    bEmergencyDetected = false;
+
+    Emergency_TrackedBlocker = nullptr;
+    Emergency_bHasPrevRelAngle = false;
+    Emergency_PrevRelAngleRad = 0.f;
+    Emergency_OrbitSignedRad = 0.f;
+    Emergency_AngleStableTime = 0.f;
+
+    Emergency_bHasPrevPos2D = false;
+    Emergency_PrevPos2D = FVector2D::ZeroVector;
+
+    Emergency_PrevSideSign = 0;
+    Emergency_FlipToggleCount = 0;
+    Emergency_FlipWindowTime = 0.f;
+
+    Emergency_ProgressSamples.Reset();
+    Emergency_ProgressWindowTime = 0.f;
+    Emergency_ProgressWindowSum = 0.f;
+}
+
+void UUnitMovementComponent::UpdateEmergencyDetection(
+    const FVector& DesiredDir,
+    const FVector& FinalDir,
+    const FVector& MyPos,
+    float DeltaTime,
+    bool /*bSoftCollisionActive*/
+)
+{
+    if (!bEnableEmergencyDetection || DeltaTime <= 0.f)
+    {
+        bEmergencyDetected = false;
+        return;
+    }
+
+    // We need a blocker to define obstacle-relative angles. If none, reset state.
+    AActor* Blocker = SoftCollisionActor.Get();
+    if (!Blocker)
+    {
+        ResetEmergencyDetection();
+        return;
+    }
+
+    // If blocker changed, reset tracking (we don't want mixed histories).
+    if (Emergency_TrackedBlocker.Get() != Blocker)
+    {
+        ResetEmergencyDetection();
+        Emergency_TrackedBlocker = Blocker;
+    }
+
+    const FVector BlockerPos = Blocker->GetActorLocation();
+    const FVector2D MyPos2D(MyPos.X, MyPos.Y);
+    const FVector2D BlockerPos2D(BlockerPos.X, BlockerPos.Y);
+    const FVector2D ToBlocker2D = (BlockerPos2D - MyPos2D);
+    if (ToBlocker2D.IsNearlyZero())
+    {
+        // Degenerate (same position). Treat as no detection this frame but keep blocker.
+        bEmergencyDetected = false;
+        return;
+    }
+
+    // --- Relative angle tracking (Atan2) ---
+    const float RelAngleRad = FMath::Atan2(MyPos2D.Y - BlockerPos2D.Y, MyPos2D.X - BlockerPos2D.X);
+
+    if (!Emergency_bHasPrevRelAngle)
+    {
+        Emergency_bHasPrevRelAngle = true;
+        Emergency_PrevRelAngleRad = RelAngleRad;
+    }
+
+    const float DeltaAngle = NormalizeAngleRad(RelAngleRad - Emergency_PrevRelAngleRad);
+    Emergency_PrevRelAngleRad = RelAngleRad;
+
+    // Signed orbit accumulation: back-and-forth cancels out.
+    Emergency_OrbitSignedRad += DeltaAngle;
+
+    // Deadlock: angle barely changes for a sustained period.
+    if (FMath::Abs(DeltaAngle) <= Emergency_SmallAngleEpsRad)
+    {
+        Emergency_AngleStableTime += DeltaTime;
+    }
+    else
+    {
+        Emergency_AngleStableTime = 0.f;
+        // When we clearly move around the blocker, decay orbit accumulation a bit to avoid runaway over long paths.
+        Emergency_OrbitSignedRad *= 0.98f;
+    }
+
+    const bool bDeadlocked = (Emergency_AngleStableTime >= Emergency_DeadlockStableSec);
+    const bool bSpinning = (FMath::Abs(Emergency_OrbitSignedRad) >= Emergency_SpinOrbitRad);
+
+    // --- Flip-flop detection: sign toggles in a short window ---
+    FVector Desired2D(DesiredDir.X, DesiredDir.Y, 0.f);
+    if (Desired2D.IsNearlyZero())
+    {
+        Desired2D = FVector(FinalDir.X, FinalDir.Y, 0.f);
+    }
+    Desired2D = Desired2D.GetSafeNormal();
+
+    const FVector ToBlocker3D(ToBlocker2D.X, ToBlocker2D.Y, 0.f);
+    const float CrossZ = (Desired2D.X * ToBlocker3D.Y) - (Desired2D.Y * ToBlocker3D.X);
+    const int32 SideSign = (CrossZ >= 0.f) ? 1 : -1;
+
+    if (Emergency_PrevSideSign == 0)
+    {
+        Emergency_PrevSideSign = SideSign;
+    }
+    else if (SideSign != Emergency_PrevSideSign)
+    {
+        Emergency_FlipToggleCount++;
+        Emergency_PrevSideSign = SideSign;
+    }
+
+    Emergency_FlipWindowTime += DeltaTime;
+    if (Emergency_FlipWindowTime >= Emergency_FlipWindowSec)
+    {
+        Emergency_FlipWindowTime = 0.f;
+        Emergency_FlipToggleCount = 0;
+        Emergency_PrevSideSign = SideSign;
+    }
+
+    const bool bFlipFlop = (Emergency_FlipToggleCount >= Emergency_FlipToggleThreshold);
+
+    // --- Progress safety net (rolling time window) ---
+    const FVector2D DeltaPos2D = Emergency_bHasPrevPos2D ? (MyPos2D - Emergency_PrevPos2D) : FVector2D::ZeroVector;
+    Emergency_PrevPos2D = MyPos2D;
+    Emergency_bHasPrevPos2D = true;
+
+    const float ForwardThisFrame = FVector2D::DotProduct(DeltaPos2D, FVector2D(Desired2D.X, Desired2D.Y));
+    Emergency_ProgressSamples.Add({ DeltaTime, ForwardThisFrame });
+    Emergency_ProgressWindowTime += DeltaTime;
+    Emergency_ProgressWindowSum += ForwardThisFrame;
+
+    while (Emergency_ProgressSamples.Num() > 0 && Emergency_ProgressWindowTime > Emergency_ProgressWindowSec)
+    {
+        const FEmergencyProgressSample& Old = Emergency_ProgressSamples[0];
+        Emergency_ProgressWindowTime -= Old.Dt;
+        Emergency_ProgressWindowSum -= Old.Forward;
+        Emergency_ProgressSamples.RemoveAt(0, 1, false);
+    }
+
+    const bool bProgressWindowReady = (Emergency_ProgressWindowTime >= (Emergency_ProgressWindowSec * 0.8f));
+    const bool bProgressFail = bProgressWindowReady && (Emergency_ProgressWindowSum < Emergency_MinProgressUnits);
+
+    // Deadlock bypasses progress gate (per Z3 fix).
+    const bool bEmergencyNeeded = bDeadlocked || ((bFlipFlop || bSpinning) && bProgressFail);
+
+    bEmergencyDetected = bEmergencyNeeded;
+}
+// ---------- Emergency detection ----------
 
 void UUnitMovementComponent::SmoothFaceDirection(const FVector& Direction, float DeltaTime)
 {
